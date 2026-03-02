@@ -8,7 +8,7 @@ Run:            python survey_tracker.py
 Key features:
   • Two always-on-top transparent overlays (map canvas + inventory grid)
   • Drag to reposition, per-overlay opacity
-  • Watches player.log for ProcessMapFx lines → places survey dots
+  • Watches ChatLogs for [Status] distance messages → places survey dots
   • First dot: click to calibrate scale; subsequent dots: auto-placed
   • Click during survey → recalibrates using most recent dot
   • Nearest-neighbour route optimisation with guided step-through
@@ -17,6 +17,7 @@ Key features:
 """
 
 import sys
+import os
 import re
 import json
 import math
@@ -44,6 +45,11 @@ HEADER_H    = 28          # px — header height for both overlays
 
 SETTINGS_PATH = Path(__file__).parent / "survey_tracker_settings.json"
 
+_GORGON_CHAT_DEFAULT = (
+    Path(os.environ.get('LOCALAPPDATA', '~')).parent
+    / 'LocalLow' / 'Elder Game' / 'Project Gorgon' / 'ChatLogs'
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Version
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,19 +64,18 @@ APP_VERSION = _ver_file.read_text().strip() if _ver_file.exists() else "dev"
 # ─────────────────────────────────────────────────────────────────────────────
 # Log-parsing helpers
 # ─────────────────────────────────────────────────────────────────────────────
-_MAP_FX_RE  = re.compile(
-    r'ProcessMapFx\(\([^)]+\),\s*\d+,\s*\d+,\s*"([^"]+)",\s*\w+,\s*"([^"]+)"\)'
-)
-_DIST_RE    = re.compile(r'(\d+(?:\.\d+)?)m\s+(west|east|north|south)', re.IGNORECASE)
-_COLLECT_RE = re.compile(r'\[Status\]\s+(.+?)\s+collected!')
+_DIST_RE         = re.compile(r'(\d+(?:\.\d+)?)m\s+(west|east|north|south)', re.IGNORECASE)
+_COLLECT_RE      = re.compile(r'\[Status\]\s+(.+?)\s+collected!')
+_SURVEY_CHAT_RE  = re.compile(r'\[Status\]\s+The\s+(.+?)\s+is\s+(.+)', re.IGNORECASE)
 
 
-def parse_mapfx_line(line: str):
-    """Return (name, offset_dict) or None."""
-    m = _MAP_FX_RE.search(line)
+def parse_chat_survey_line(line: str):
+    """Return (name, offset_dict) or None — parses chat [Status] distance messages."""
+    m = _SURVEY_CHAT_RE.search(line)
     if not m:
         return None
-    name, desc = m.group(1), m.group(2)
+    name = m.group(1).strip()
+    desc = m.group(2)
     east = north = 0.0
     for dm in _DIST_RE.finditer(desc):
         dist, direction = float(dm.group(1)), dm.group(2).lower()
@@ -78,6 +83,8 @@ def parse_mapfx_line(line: str):
         elif direction == 'west':  east  -= dist
         elif direction == 'north': north += dist
         elif direction == 'south': north -= dist
+    if east == 0.0 and north == 0.0:
+        return None
     return name, {'east': east, 'north': north}
 
 
@@ -171,11 +178,33 @@ class SurveyState:
             route.append(nearest['id'])
             current = nearest['pixel_pos']
             remaining.remove(nearest)
-        self.route_order = route
-        for idx, iid in enumerate(route):
+        self.route_order = self._two_opt(route)
+        for idx, iid in enumerate(self.route_order):
             item = next((i for i in self.items if i['id'] == iid), None)
             if item:
                 item['route_order'] = idx
+
+    def _two_opt(self, route: list) -> list:
+        """Improve a route with 2-opt edge swaps until no swap reduces total distance."""
+        if len(route) < 4:
+            return route
+        pos   = {i['id']: i['pixel_pos'] for i in self.items}
+        start = self.player_pos or (0.0, 0.0)
+        pts   = [start] + [pos[iid] for iid in route]
+        ids   = [None]  + list(route)
+        n     = len(pts)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(n - 2):
+                for j in range(i + 2, n - 1):
+                    d_old = pt_dist(pts[i], pts[i+1]) + pt_dist(pts[j], pts[j+1])
+                    d_new = pt_dist(pts[i], pts[j])   + pt_dist(pts[i+1], pts[j+1])
+                    if d_new < d_old - 1e-9:
+                        pts[i+1:j+1] = pts[i+1:j+1][::-1]
+                        ids[i+1:j+1] = ids[i+1:j+1][::-1]
+                        improved = True
+        return ids[1:]
 
     @property
     def active_id(self):
@@ -283,6 +312,7 @@ class MapOverlay(DragMixin, QWidget):
         self._drag_init()
         self._bg_alpha      = 0.18
         self._click_through = False
+        self._show_labels   = True
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -325,7 +355,7 @@ class MapOverlay(DragMixin, QWidget):
         p.fillRect(0, cy, w, h - cy, QColor(10, 10, 20, int(self._bg_alpha * 255)))
 
         # border
-        p.setPen(QPen(QColor(255, 255, 255, 55), 1))
+        p.setPen(QPen(QColor(100, 170, 255, 180), 1.5))
         p.drawRoundedRect(0, 0, w - 1, h - 1, 5, 5)
 
         # ── route lines ──
@@ -343,6 +373,17 @@ class MapOverlay(DragMixin, QWidget):
             for i in range(len(pts) - 1):
                 x1, y1 = pts[i];     x2, y2 = pts[i + 1]
                 p.drawLine(int(x1), int(y1 + cy), int(x2), int(y2 + cy))
+
+        # ── player marker (drawn first so survey dots appear on top) ──
+        if self.state.player_pos:
+            px, py_ = self.state.player_pos
+            py_s = py_ + cy
+            p.setBrush(QBrush(QColor(0, 230, 118, 220)))
+            p.setPen(QPen(QColor(255, 255, 255, 220), 2))
+            p.drawEllipse(int(px) - 7, int(py_s) - 7, 14, 14)
+            p.setPen(QColor(0, 230, 118, 200))
+            p.setFont(QFont('Segoe UI', 7))
+            p.drawText(int(px) - 12, int(py_s) + 10, 'You')
 
         # ── survey dots ──
         p.setFont(QFont('Segoe UI', 8))
@@ -367,17 +408,6 @@ class MapOverlay(DragMixin, QWidget):
 
             self._draw_dot(p, dx, dy_screen, kind, item)
 
-        # ── player marker ──
-        if self.state.player_pos:
-            px, py_ = self.state.player_pos
-            py_s = py_ + cy
-            p.setBrush(QBrush(QColor(0, 230, 118, 220)))
-            p.setPen(QPen(QColor(255, 255, 255, 220), 2))
-            p.drawEllipse(int(px) - 7, int(py_s) - 7, 14, 14)
-            p.setPen(QColor(0, 230, 118, 200))
-            p.setFont(QFont('Segoe UI', 7))
-            p.drawText(int(px) - 12, int(py_s) + 10, 'You')
-
         # ── cursor hint ──
         if self.state.phase in ('set_player', 'calibrating'):
             p.setPen(QColor(255, 200, 60, 180))
@@ -387,7 +417,7 @@ class MapOverlay(DragMixin, QWidget):
             p.drawText(4, h - 6, hint)
 
     def _draw_dot(self, p, dx, dy, kind, item):
-        DOT_R = 5
+        DOT_R = 4
         colours = {
             'pending':   (QColor(255, 193,  7, 230), QColor(255, 255, 255, 200)),
             'placed':    (QColor( 79, 195, 247, 210), QColor(255, 255, 255, 160)),
@@ -400,6 +430,9 @@ class MapOverlay(DragMixin, QWidget):
         p.drawEllipse(int(dx) - DOT_R, int(dy) - DOT_R, DOT_R * 2, DOT_R * 2)
 
         if kind == 'collected':
+            return
+
+        if not self._show_labels:
             return
 
         # label
@@ -468,7 +501,7 @@ class SlotWidget(QFrame):
         if not self.item:
             # empty slot
             p.fillRect(0, 0, w, h, QColor(35, 25, 12, 180))
-            p.setPen(QPen(QColor(160, 120, 55, 75), 1))
+            p.setPen(QPen(QColor(100, 170, 255, 100), 1))
             p.drawRoundedRect(0, 0, w - 1, h - 1, 2, 2)
             return
 
@@ -480,7 +513,7 @@ class SlotWidget(QFrame):
             p.setPen(QPen(QColor(255, 193, 7, 200), 2))
         else:
             p.fillRect(0, 0, w, h, QColor(35, 25, 12, 200))
-            p.setPen(QPen(QColor(180, 140, 70, 160), 1))
+            p.setPen(QPen(QColor(100, 170, 255, 150), 1))
         p.drawRoundedRect(0, 0, w - 1, h - 1, 2, 2)
 
         # item name
@@ -595,7 +628,7 @@ class InventoryOverlay(DragMixin, QWidget):
         p.drawText(8, 0, w - 20, HEADER_H, Qt.AlignVCenter, 'Survey Inventory')
 
         # border
-        p.setPen(QPen(QColor(255, 255, 255, 55), 1))
+        p.setPen(QPen(QColor(100, 170, 255, 180), 1.5))
         p.drawRoundedRect(0, 0, w - 1, h - 1, 5, 5)
 
     def mousePressEvent(self, event):
@@ -645,6 +678,16 @@ class ControlPanel(QWidget):
         )
         return b
 
+    def _small_btn(self, text, callback, color='#1a1a2e'):
+        b = QPushButton(text)
+        b.clicked.connect(callback)
+        b.setStyleSheet(
+            f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ background: #2a3a5a; }}'
+        )
+        return b
+
     def _label(self, text, color='#778'):
         lb = QLabel(text)
         lb.setStyleSheet(f'color:{color}; font-size:11px;')
@@ -668,11 +711,9 @@ class ControlPanel(QWidget):
         # ── Files row ──────────────────────────────────────────────────────
         row = QHBoxLayout()
         row.addWidget(self._label('Files:'))
-        self.btn_log  = self._btn('📋 player.log',     self.app.select_player_log)
         self.btn_chat = self._btn('💬 ChatLogs folder', self.app.select_chat_dir)
-        row.addWidget(self.btn_log)
         row.addWidget(self.btn_chat)
-        self.lbl_file_status = self._label('No log loaded', '#556')
+        self.lbl_file_status = self._label('No chat dir set', '#556')
         row.addWidget(self.lbl_file_status)
         row.addStretch()
         main.addLayout(row)
@@ -719,35 +760,46 @@ class ControlPanel(QWidget):
         row3.addStretch()
         main.addLayout(row3)
 
-        # ── Opacity / click-through ───────────────────────────────────────
-        row4 = QHBoxLayout()
-        row4.addWidget(self._label('Map opacity:'))
+        # ── Opacity (stacked) + toggle buttons ───────────────────────────
+        slider_col = QVBoxLayout()
+        slider_col.setSpacing(3)
+
+        row_ms = QHBoxLayout()
+        row_ms.addWidget(self._label('Map:'))
         self.sl_map_opacity = QSlider(Qt.Horizontal)
         self.sl_map_opacity.setRange(3, 85)
         self.sl_map_opacity.setValue(18)
         self.sl_map_opacity.setMaximumWidth(100)
         self.sl_map_opacity.valueChanged.connect(
             lambda v: self.app.set_overlay_opacity('map', v))
-        row4.addWidget(self.sl_map_opacity)
+        row_ms.addWidget(self.sl_map_opacity)
+        slider_col.addLayout(row_ms)
 
-        row4.addSpacing(12)
-        row4.addWidget(self._label('Inv opacity:'))
+        row_is = QHBoxLayout()
+        row_is.addWidget(self._label('Inv:'))
         self.sl_inv_opacity = QSlider(Qt.Horizontal)
         self.sl_inv_opacity.setRange(3, 95)
         self.sl_inv_opacity.setValue(35)
         self.sl_inv_opacity.setMaximumWidth(100)
         self.sl_inv_opacity.valueChanged.connect(
             lambda v: self.app.set_overlay_opacity('inv', v))
-        row4.addWidget(self.sl_inv_opacity)
+        row_is.addWidget(self.sl_inv_opacity)
+        slider_col.addLayout(row_is)
 
-        row4.addSpacing(12)
-        self.btn_click_through = self._btn('🖱 Map Pass-Through: OFF',
-                                           self.app.toggle_map_click_through, '#3a2a0a')
+        row4 = QHBoxLayout()
+        row4.addLayout(slider_col)
+        row4.addSpacing(10)
+        self.btn_click_through = self._small_btn('Map Pass-Thru: OFF',
+                                                 self.app.toggle_map_click_through, '#3a2a0a')
         row4.addWidget(self.btn_click_through)
-        row4.addSpacing(8)
-        self.btn_inv_lock = self._btn('🔓 Inv Unlocked',
-                                      self.app.toggle_inv_lock, '#1a3a1a')
+        row4.addSpacing(4)
+        self.btn_inv_lock = self._small_btn('Inv: Unlocked',
+                                            self.app.toggle_inv_lock, '#1a3a1a')
         row4.addWidget(self.btn_inv_lock)
+        row4.addSpacing(4)
+        self.btn_labels = self._small_btn('Labels: ON',
+                                          self.app.toggle_map_labels, '#1a2a3a')
+        row4.addWidget(self.btn_labels)
         row4.addStretch()
         main.addLayout(row4)
 
@@ -792,9 +844,20 @@ class ControlPanel(QWidget):
             f'{active} active{f", {done} collected" if done else ""}' if total else '0 items'
         )
 
-        self.btn_start.setEnabled(state.player_pos is not None and state.phase == 'idle')
-        self.btn_done.setEnabled(state.phase == 'surveying' and len(state.uncollected()) > 0)
-        self.btn_next.setEnabled(state.phase == 'routing')
+        has_items    = bool(state.items)
+        has_pos      = state.player_pos is not None
+        has_chat_dir = getattr(self.app, '_chat_dir', None) is not None
+        placed       = any(i.get('pixel_pos') for i in state.uncollected())
+
+        self.btn_set_pos.setVisible(state.phase != 'routing')
+        self.btn_start.setVisible(
+            state.phase == 'idle' and has_pos and has_chat_dir
+        )
+        self.btn_done.setVisible(
+            state.phase in ('surveying', 'calibrating') and placed
+        )
+        self.btn_next.setVisible(state.phase == 'routing')
+        self.btn_reset.setVisible(has_items or state.phase != 'idle')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -810,18 +873,16 @@ class SurveyApp:
 
         self.map_overlay.canvas_clicked.connect(self._on_map_canvas_click)
 
-        self._log_path       = None
-        self._log_offset     = 0
         self._chat_dir       = None
         self._chat_file      = None
         self._chat_offset    = 0
         self._click_through  = False
         self._inv_locked     = False
 
-        # Polling timer (2 s)
+        # Polling timer (0.5 s)
         self._timer = QTimer()
         self._timer.timeout.connect(self._poll)
-        self._timer.start(2000)
+        self._timer.start(500)
 
         # Blink timer for pending dot
         self._blink_timer = QTimer()
@@ -834,31 +895,17 @@ class SurveyApp:
         self.inv_overlay.show()
         self.control.show()
 
-        # Inventory starts unlocked so the user can position/resize it.
-        # Press "Inv Unlocked" in the control panel to lock it (pass clicks to game).
-        self._inv_locked = False
-
     # ── file selection ────────────────────────────────────────────────────────
-    def select_player_log(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self.control, 'Select player.log', '', 'Log files (*.log);;All files (*)'
-        )
-        if not path:
-            return
-        self._log_path   = path
-        self._log_offset = Path(path).stat().st_size   # start from end
-        self.control.lbl_file_status.setText('player.log loaded')
-        self._set_log('player.log loaded. Set your position, then start the survey.')
-        self.save_settings()
-
     def select_chat_dir(self):
-        path = QFileDialog.getExistingDirectory(self.control, 'Select ChatLogs folder', '')
+        start = str(_GORGON_CHAT_DEFAULT) if _GORGON_CHAT_DEFAULT.is_dir() else ''
+        path = QFileDialog.getExistingDirectory(self.control, 'Select ChatLogs folder', start)
         if not path:
             return
         self._chat_dir    = path
         self._chat_file   = None
         self._chat_offset = 0
-        self._set_log('ChatLogs folder selected — monitoring for collection events.')
+        self.control.lbl_file_status.setText('Chat dir loaded')
+        self._set_log('ChatLogs folder selected — monitoring for survey markers and collections.')
         self.save_settings()
 
     # ── phase transitions ─────────────────────────────────────────────────────
@@ -873,7 +920,7 @@ class SurveyApp:
             return
         self.state.phase = 'surveying'
         self._refresh_all()
-        self._set_log('Watching player.log for survey markers. Survey your maps in-game!')
+        self._set_log('Watching chat log for survey markers. Survey your maps in-game!')
 
     def done_surveying(self):
         uncollected = self.state.uncollected()
@@ -965,8 +1012,8 @@ class SurveyApp:
             self._refresh_all()
             return
 
-        # During survey/routing: recalibrate using most recent placed item
-        if state.phase in ('surveying', 'routing'):
+        # During survey: recalibrate using most recent placed item
+        if state.phase == 'surveying':
             last = next(
                 (i for i in reversed(state.items) if not i['collected'] and i['pixel_pos']),
                 None
@@ -1024,13 +1071,13 @@ class SurveyApp:
         target = None
         if state.phase == 'routing' and state.active_id:
             cur = next((i for i in state.items if i['id'] == state.active_id), None)
-            if cur and not cur['collected'] and clean_name(cur['name']).lower() in name_low:
+            if cur and not cur['collected'] and clean_name(cur['name']).lower() == name_low:
                 target = cur
 
         if not target:
             target = next(
                 (i for i in state.items
-                 if not i['collected'] and clean_name(i['name']).lower() in name_low),
+                 if not i['collected'] and clean_name(i['name']).lower() == name_low),
                 None
             )
         if not target:
@@ -1071,26 +1118,7 @@ class SurveyApp:
 
     # ── polling ───────────────────────────────────────────────────────────────
     def _poll(self):
-        self._poll_player_log()
         self._poll_chat_log()
-
-    def _poll_player_log(self):
-        if not self._log_path:
-            return
-        try:
-            path = Path(self._log_path)
-            size = path.stat().st_size
-            if size > self._log_offset:
-                with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                    f.seek(self._log_offset)
-                    new_text = f.read()
-                self._log_offset = size
-                for line in new_text.splitlines():
-                    result = parse_mapfx_line(line)
-                    if result:
-                        self._on_survey_item(*result)
-        except Exception:
-            pass
 
     def _poll_chat_log(self):
         if not self._chat_dir:
@@ -1107,7 +1135,7 @@ class SurveyApp:
                         latest       = p
                 if latest:
                     self._chat_file   = latest
-                    self._chat_offset = 0
+                    self._chat_offset = latest.stat().st_size  # start from end
 
             if not self._chat_file:
                 return
@@ -1124,6 +1152,9 @@ class SurveyApp:
                     new_text = f.read()
                 self._chat_offset = size
                 for line in new_text.splitlines():
+                    result = parse_chat_survey_line(line)
+                    if result:
+                        self._on_survey_item(*result)
                     name = parse_collect_line(line)
                     if name:
                         self._on_item_collected(name)
@@ -1163,30 +1194,45 @@ class SurveyApp:
         self.map_overlay.set_click_through(self._click_through)
         label = 'ON' if self._click_through else 'OFF'
         color = '#1a4a1a' if self._click_through else '#3a2a0a'
-        self.control.btn_click_through.setText(f'🖱 Map Pass-Through: {label}')
+        self.control.btn_click_through.setText(f'Map Pass-Thru: {label}')
         self.control.btn_click_through.setStyleSheet(
             f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
-            f'padding:5px 10px; border-radius:4px; font-size:12px; font-weight:600; }}'
-            f'QPushButton:hover {{ filter:brightness(1.2); }}'
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ border-color: #8ab; }}'
         )
+        self.save_settings()
 
     def toggle_inv_lock(self):
         self._inv_locked = not self._inv_locked
         _set_click_through(int(self.inv_overlay.winId()), self._inv_locked)
         if self._inv_locked:
-            self.control.btn_inv_lock.setText('🔒 Inv Locked')
+            self.control.btn_inv_lock.setText('Inv: Locked')
             self.control.btn_inv_lock.setStyleSheet(
                 'QPushButton { background:#3a1a00; color:#cde; border:1px solid #446; '
-                'padding:5px 10px; border-radius:4px; font-size:12px; font-weight:600; }'
-                'QPushButton:hover { filter:brightness(1.2); }'
+                'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }'
+                'QPushButton:hover { border-color: #8ab; }'
             )
         else:
-            self.control.btn_inv_lock.setText('🔓 Inv Unlocked')
+            self.control.btn_inv_lock.setText('Inv: Unlocked')
             self.control.btn_inv_lock.setStyleSheet(
                 'QPushButton { background:#1a3a1a; color:#cde; border:1px solid #446; '
-                'padding:5px 10px; border-radius:4px; font-size:12px; font-weight:600; }'
-                'QPushButton:hover { filter:brightness(1.2); }'
+                'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }'
+                'QPushButton:hover { border-color: #8ab; }'
             )
+        self.save_settings()
+
+    def toggle_map_labels(self):
+        self.map_overlay._show_labels = not self.map_overlay._show_labels
+        label = 'ON' if self.map_overlay._show_labels else 'OFF'
+        color = '#1a2a3a' if self.map_overlay._show_labels else '#2a2a2a'
+        self.control.btn_labels.setText(f'Labels: {label}')
+        self.control.btn_labels.setStyleSheet(
+            f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ border-color: #8ab; }}'
+        )
+        self.map_overlay.refresh()
+        self.save_settings()
 
     # ── settings persistence ──────────────────────────────────────────────────
     def save_settings(self):
@@ -1203,9 +1249,16 @@ class SurveyApp:
                     'x': ig.x(), 'y': ig.y(), 'w': ig.width(), 'h': ig.height(),
                     'opacity': int(self.inv_overlay._bg_alpha * 100),
                 },
-                'log_path':     self._log_path,
                 'chat_dir':     self._chat_dir,
                 'survey_count': self.state.survey_count,
+                'map_labels':   self.map_overlay._show_labels,
+                'inv_locked':   self._inv_locked,
+                'map_click_through': self._click_through,
+                'grid': {
+                    'cols':      GRID_COLS,
+                    'slot_size': SLOT_SIZE,
+                    'slot_gap':  SLOT_GAP,
+                },
             }
             SETTINGS_PATH.write_text(json.dumps(data, indent=2))
         except Exception:
@@ -1226,9 +1279,15 @@ class SurveyApp:
                 if 'opacity' in s:
                     overlay._bg_alpha = s['opacity'] / 100.0
 
-            # Sync slider / spinbox values
-            self.control.sl_map_opacity.setValue(int(self.map_overlay._bg_alpha * 100))
-            self.control.sl_inv_opacity.setValue(int(self.inv_overlay._bg_alpha * 100))
+            # Sync slider / spinbox values (block signals to avoid triggering save_settings
+            # before log_path / chat_dir have been restored)
+            for sl, val in (
+                (self.control.sl_map_opacity, int(self.map_overlay._bg_alpha * 100)),
+                (self.control.sl_inv_opacity, int(self.inv_overlay._bg_alpha * 100)),
+            ):
+                sl.blockSignals(True)
+                sl.setValue(val)
+                sl.blockSignals(False)
             if 'survey_count' in data:
                 sc = int(data['survey_count'])
                 self.state.survey_count = sc
@@ -1236,16 +1295,41 @@ class SurveyApp:
                 self.control.sb_count.setValue(sc)
                 self.control.sb_count.blockSignals(False)
 
-            if data.get('log_path'):
-                self._log_path   = data['log_path']
-                try:
-                    self._log_offset = Path(self._log_path).stat().st_size
-                    self.control.lbl_file_status.setText('player.log (auto)')
-                except Exception:
-                    self._log_path = None
+            if 'map_labels' in data:
+                self.map_overlay._show_labels = bool(data['map_labels'])
+                label = 'ON' if self.map_overlay._show_labels else 'OFF'
+                self.control.btn_labels.setText(f'Labels: {label}')
+
+            if 'inv_locked' in data:
+                self._inv_locked = bool(data['inv_locked'])
+                _set_click_through(int(self.inv_overlay.winId()), self._inv_locked)
+                label = 'Locked' if self._inv_locked else 'Unlocked'
+                color = '#3a1a00' if self._inv_locked else '#1a3a1a'
+                self.control.btn_inv_lock.setText(f'Inv: {label}')
+                self.control.btn_inv_lock.setStyleSheet(
+                    f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
+                    f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+                    f'QPushButton:hover {{ border-color: #8ab; }}'
+                )
+
+            if 'map_click_through' in data:
+                self._click_through = bool(data['map_click_through'])
+                self.map_overlay.set_click_through(self._click_through)
+                label = 'ON' if self._click_through else 'OFF'
+                color = '#1a4a1a' if self._click_through else '#3a2a0a'
+                self.control.btn_click_through.setText(f'Map Pass-Thru: {label}')
+                self.control.btn_click_through.setStyleSheet(
+                    f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
+                    f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+                    f'QPushButton:hover {{ border-color: #8ab; }}'
+                )
 
             if data.get('chat_dir') and Path(data['chat_dir']).is_dir():
                 self._chat_dir = data['chat_dir']
+                self.control.lbl_file_status.setText('Chat dir (auto)')
+            elif _GORGON_CHAT_DEFAULT.is_dir():
+                self._chat_dir = str(_GORGON_CHAT_DEFAULT)
+                self.control.lbl_file_status.setText('Chat dir (auto)')
 
         except Exception:
             pass
@@ -1263,6 +1347,20 @@ class SurveyApp:
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
+def _apply_grid_config():
+    """Load GRID_COLS / SLOT_SIZE / SLOT_GAP from settings before overlays are created."""
+    global GRID_COLS, SLOT_SIZE, SLOT_GAP
+    try:
+        if SETTINGS_PATH.exists():
+            data = json.loads(SETTINGS_PATH.read_text())
+            g = data.get('grid', {})
+            if 'cols'      in g: GRID_COLS = max(1,  int(g['cols']))
+            if 'slot_size' in g: SLOT_SIZE  = max(16, int(g['slot_size']))
+            if 'slot_gap'  in g: SLOT_GAP   = max(0,  int(g['slot_gap']))
+    except Exception:
+        pass
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
@@ -1285,6 +1383,7 @@ def main():
     palette.setColor(QPalette.HighlightedText, QColor(230, 240, 255))
     app.setPalette(palette)
 
+    _apply_grid_config()
     survey = SurveyApp()   # noqa — keeps windows alive
     sys.exit(app.exec_())
 

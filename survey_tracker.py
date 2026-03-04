@@ -106,7 +106,7 @@ def pt_dist(a, b):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Windows click-through helpers  (no-op on non-Windows)
+# Click-through helpers  (Windows + macOS via PyObjC)
 # ─────────────────────────────────────────────────────────────────────────────
 _GWL_EXSTYLE     = -20
 _WS_EX_LAYERED   = 0x00080000
@@ -114,16 +114,28 @@ _WS_EX_TRANSPARENT = 0x00000020
 
 
 def _set_click_through(hwnd_int: int, enabled: bool):
-    try:
-        user32 = ctypes.windll.user32
-        style  = user32.GetWindowLongW(hwnd_int, _GWL_EXSTYLE)
-        if enabled:
-            style |= (_WS_EX_LAYERED | _WS_EX_TRANSPARENT)
-        else:
-            style &= ~_WS_EX_TRANSPARENT
-        user32.SetWindowLongW(hwnd_int, _GWL_EXSTYLE, style)
-    except Exception:
-        pass  # silently fail on non-Windows
+    if sys.platform == 'win32':
+        try:
+            user32 = ctypes.windll.user32
+            style  = user32.GetWindowLongW(hwnd_int, _GWL_EXSTYLE)
+            if enabled:
+                style |= (_WS_EX_LAYERED | _WS_EX_TRANSPARENT)
+            else:
+                style &= ~_WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd_int, _GWL_EXSTYLE, style)
+        except Exception:
+            pass
+    elif sys.platform == 'darwin':
+        try:
+            from AppKit import NSView  # PyObjC
+            ns_view   = NSView(hwnd_int)
+            ns_window = ns_view.window()
+            if ns_window:
+                ns_window.setIgnoresMouseEvents_(bool(enabled))
+        except ImportError:
+            pass  # PyObjC not available
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,6 +382,8 @@ class MapOverlay(DragMixin, QWidget):
         self._show_labels   = True
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        if sys.platform == 'darwin':   # Qt.Tool → NSPanel which auto-hides on deactivation
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(200, 120)
         self.resize(460, 460)
@@ -618,6 +632,8 @@ class InventoryOverlay(DragMixin, QWidget):
         self._slots    = []
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        if sys.platform == 'darwin':   # Qt.Tool → NSPanel which auto-hides on deactivation
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(SLOT_SIZE * 3 + SLOT_GAP * 2 + 12,
                             SLOT_SIZE + HEADER_H + 12)
@@ -998,6 +1014,8 @@ class SurveyApp:
         self.map_overlay.show()
         self.inv_overlay.show()
         self.control.show()
+        _macos_raise_overlay(self.map_overlay)
+        _macos_raise_overlay(self.inv_overlay)
 
     # ── file selection ────────────────────────────────────────────────────────
     def select_chat_dir(self):
@@ -1350,6 +1368,8 @@ class SurveyApp:
         if self._overlays_visible:
             self.map_overlay.show()
             self.inv_overlay.show()
+            _macos_raise_overlay(self.map_overlay)
+            _macos_raise_overlay(self.inv_overlay)
         else:
             self.map_overlay.hide()
             self.inv_overlay.hide()
@@ -1606,8 +1626,45 @@ def _apply_grid_config():
         pass
 
 
+def _macos_activate():
+    """Make the process behave like a regular app on macOS (show Dock icon, receive focus)."""
+    if sys.platform != 'darwin':
+        return
+    try:
+        from AppKit import NSApplication  # PyObjC — available in most conda/system Pythons
+        ns_app = NSApplication.sharedApplication()
+        ns_app.setActivationPolicy_(0)       # NSApplicationActivationPolicyRegular
+        ns_app.activateIgnoringOtherApps_(True)
+    except ImportError:
+        pass  # PyObjC not installed — skip silently
+    except Exception:
+        pass
+
+
+_MACOS_OVERLAY_LEVEL = 25   # NSStatusWindowLevel — above normal & floating windows
+_MACOS_JOIN_ALL      = 1    # NSWindowCollectionBehaviorCanJoinAllSpaces
+
+
+def _macos_raise_overlay(widget):
+    """Raise the overlay above normal windows and pin it to all Spaces (macOS only)."""
+    if sys.platform != 'darwin':
+        return
+    try:
+        from AppKit import NSView
+        ns_view   = NSView(int(widget.winId()))
+        ns_window = ns_view.window()
+        if ns_window:
+            ns_window.setLevel_(_MACOS_OVERLAY_LEVEL)
+            ns_window.setCollectionBehavior_(_MACOS_JOIN_ALL)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+
 def main():
     app = QApplication(sys.argv)
+    _macos_activate()   # must be called after QApplication initialises Cocoa
     app.setStyle('Fusion')
 
     # Dark palette

@@ -243,6 +243,24 @@ def _set_click_through(hwnd_int: int, enabled: bool):
             pass  # PyObjC not available
         except Exception:
             pass
+    elif sys.platform.startswith('linux'):
+        try:
+            from Xlib import display, X
+            from Xlib.ext import shape
+            d   = display.Display()
+            win = d.create_resource_object('window', hwnd_int)
+            if enabled:
+                # Empty input rectangle list → all clicks pass through
+                win.shape_rectangles(shape.SK.Input, shape.SO.Set,
+                                     X.Unsorted, 0, 0, [])
+            else:
+                # Clear override → input region reverts to bounding box
+                win.shape_mask(shape.SK.Input, shape.SO.Set, 0, 0, X.NONE)
+            d.sync()
+        except ImportError:
+            pass  # python-xlib not installed
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

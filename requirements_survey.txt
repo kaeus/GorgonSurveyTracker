@@ -1,1 +1,7 @@
 PyQt5>=5.15
+
+# Optional platform-specific dependencies:
+# macOS click-through support:
+#   pip install pyobjc-framework-Cocoa
+# Linux (X11) click-through support:
+#   pip install python-xlib

@@ -243,6 +243,24 @@ def _set_click_through(hwnd_int: int, enabled: bool):
             pass  # PyObjC not available
         except Exception:
             pass
+    elif sys.platform.startswith('linux'):
+        try:
+            from Xlib import display, X
+            from Xlib.ext import shape
+            d   = display.Display()
+            win = d.create_resource_object('window', hwnd_int)
+            if enabled:
+                # Empty input rectangle list → all clicks pass through
+                win.shape_rectangles(shape.SO.Set, shape.SK.Input,
+                                     X.Unsorted, 0, 0, [])
+            else:
+                # Clear override → input region reverts to bounding box
+                win.shape_mask(shape.SO.Set, shape.SK.Input, 0, 0, X.NONE)
+            d.sync()
+        except ImportError:
+            pass  # python-xlib not installed
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2112,6 +2130,8 @@ class SurveyApp:
         if self._overlays_visible:
             self.map_overlay.show()
             self.inv_overlay.show()
+            self.map_overlay.set_click_through(self._click_through)
+            _set_click_through(int(self.inv_overlay.winId()), self._inv_locked)
             _macos_raise_overlay(self.map_overlay)
             _macos_raise_overlay(self.inv_overlay)
         else:

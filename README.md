@@ -75,6 +75,30 @@ Motherlode surveys give only a raw distance (`The treasure is 2733 meters from h
 pip install PyQt5
 ```
 
+## macOS / Linux Support
+
+The overlay runs on macOS and Linux (X11) with some additional optional dependencies for click-through support.
+
+### macOS
+
+Install PyObjC to enable the click-through toggle on macOS:
+
+```
+pip install pyobjc-framework-Cocoa
+```
+
+Without this, the overlay will display correctly but the click-through toggle will have no effect.
+
+### Linux (X11)
+
+Install python-xlib to enable click-through on X11:
+
+```
+pip install python-xlib
+```
+
+> **Note:** Overlay might have additional issues if running under some sort of Windows emulation
+
 ## Running from source
 
 ```

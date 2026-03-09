@@ -2130,6 +2130,8 @@ class SurveyApp:
         if self._overlays_visible:
             self.map_overlay.show()
             self.inv_overlay.show()
+            self.map_overlay.set_click_through(self._click_through)
+            _set_click_through(int(self.inv_overlay.winId()), self._inv_locked)
             _macos_raise_overlay(self.map_overlay)
             _macos_raise_overlay(self.inv_overlay)
         else:

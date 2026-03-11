@@ -14,9 +14,11 @@ A transparent overlay tool for **Project Gorgon** that helps players track and c
 
 ## Screenshots
 
-![Tracker Window](/ReadmeScreens/TrackerWindow.png?raw=true "Main Tracker Window")
+![Tracker Window](https://raw.githubusercontent.com/kaeus/GorgonSurveyTracker/refs/heads/main/ReadmeScreens/TrackerWindow.png "Main Tracker Window")
 
-![Overlays](/ReadmeScreens/Overlay.png?raw=true "Example Overlays")
+![Overlays](https://raw.githubusercontent.com/kaeus/GorgonSurveyTracker/refs/heads/main/ReadmeScreens/Overlay.png "Example Overlays")
+
+![Summary Window](https://raw.githubusercontent.com/kaeus/GorgonSurveyTracker/refs/heads/main/ReadmeScreens/SummaryWindow.png "Summary")
 
 ## In game setup
 
@@ -30,11 +32,22 @@ The program relies on chat logs. To enable these, go to the Game Settings, under
 4. Click **📍 Set My Position** and click your character's position on the map overlay to establish the origin.
 5. Begin surveying in-game. Each `[Status] The X is Ym DIR` chat message places a dot on the overlay.
 6. On the first area, click it on the map to calibrate the scale. Subsequent dots appear automatically, but can be adjusted by clicking the map.
-7. Use **🗺 Optimize Route** to step through the nearest-neighbour path to collect each item efficiently.
+7. Use **🗺 Optimize Route** to step through the nearest-neighbour path to collect each item efficiently. This also starts the session timer for the summary.
 8. Collect items in-game — they are removed from the inventory grid automatically when the chat log shows `"X collected!"`. Click **→ Skip to Next** to skip a node if necessary.
-9. Profit!
+9. Once the final item is collected, a **📊 View Summary** button appears next to Reset. Click it to see your session breakdown.
+10. Profit!
 
 > **Tip:** The inventory grid layout (`cols`, `slot_size`, `slot_gap`) can be tweaked by editing the `grid` section in `survey_tracker_settings.json` if you dont want to use 10 columns, or your inferace is scaled differently.
+
+## Session Summary
+
+After completing a routing session (all items collected), clicking **📊 View Summary** opens a summary window showing:
+
+- **Maps Completed** — total items collected this session
+- **Start / End Time** and **Duration** — tracked from when Optimize Route is clicked to the final collection
+- **Avg Survey Time** — average time between consecutive item collections
+- **XP Gained** — Surveying, Mining, Geology, accumulated from chat messages during the session
+- **Items Found** table — every item name with its count and percentage of total, sorted by count descending, with a visual bar for easy comparison
 
 ## Usage (Motherlode)
 

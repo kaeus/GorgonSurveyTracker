@@ -24,12 +24,15 @@ import json
 import math
 import time
 import ctypes
+import datetime
+from collections import Counter
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QSlider, QSpinBox,
     QGridLayout, QVBoxLayout, QHBoxLayout, QFrame,
     QFileDialog, QMessageBox, QSizeGrip,
+    QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
 )
 from PyQt5.QtCore  import Qt, QTimer, QPoint, QSize, pyqtSignal
 from PyQt5.QtGui   import (
@@ -73,6 +76,10 @@ _COLLECT_RE      = re.compile(r'\[Status\]\s+(.+?)\s+collected!')
 _SURVEY_CHAT_RE  = re.compile(r'\[Status\]\s+The\s+(.+?)\s+is\s+(.+)', re.IGNORECASE)
 _ML_DIST_RE      = re.compile(r'\[Status\]\s+The treasure is (\d+(?:\.\d+)?) meters from here\.', re.IGNORECASE)
 _ML_COLLECT_RE   = re.compile(r'\[Status\]\s+(?:.+?) Metal Slab x\d+ added to inventory\.', re.IGNORECASE)
+_XP_RE           = re.compile(r'\[Status\]\s+You earned ([\d,]+) XP in (.+?)\.', re.IGNORECASE)
+_INV_ADD_RE      = re.compile(r'\[Status\]\s+(.+?)\s+x(\d+)\s+added to inventory\.', re.IGNORECASE)
+_BONUS_RE        = re.compile(r'Also found (.+?)(?:\s+x(\d+))?\s+\(speed bonus', re.IGNORECASE)
+_XP_SKILLS       = frozenset({'surveying', 'mining', 'geology'})
 
 
 def parse_chat_survey_line(line: str):
@@ -1121,6 +1128,146 @@ class InventoryOverlay(DragMixin, QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Summary Window
+# ─────────────────────────────────────────────────────────────────────────────
+class SummaryWindow(QDialog):
+    """Post-session summary: stats, XP gains, and items-found table."""
+
+    _BASE_STYLE = (
+        'QDialog, QWidget { background:#0e0e1e; color:#cde; }'
+        'QLabel  { color:#cde; }'
+        'QPushButton { background:#1a3a6a; color:#cde; border:1px solid #446; '
+        '  padding:5px 14px; border-radius:4px; font-size:12px; font-weight:600; }'
+        'QPushButton:hover { background:#2a4a8a; }'
+        'QTableWidget { background:#0a0a18; color:#cde; '
+        '  border:1px solid #334; gridline-color:#1e1e30; }'
+        'QHeaderView::section { background:#12122a; color:#8ab; '
+        '  border:1px solid #334; padding:4px 6px; font-weight:700; font-size:11px; }'
+        'QTableWidget::item { padding:3px 6px; }'
+        'QScrollBar:vertical { background:#0a0a18; width:10px; }'
+        'QScrollBar::handle:vertical { background:#334; border-radius:4px; }'
+    )
+
+    def __init__(self, data: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Survey Session Summary')
+        self.setMinimumWidth(500)
+        self.setStyleSheet(self._BASE_STYLE)
+        self._build_ui(data)
+
+    def _section_label(self, text: str) -> QLabel:
+        lb = QLabel(text)
+        lb.setStyleSheet('font-size:12px; font-weight:700; color:#8ab; '
+                         'padding-top:4px; padding-bottom:2px;')
+        return lb
+
+    def _stat_row(self, grid: QGridLayout, row: int, label: str, value: str,
+                  value_color: str = '#cde'):
+        lbl = QLabel(label + ':')
+        lbl.setStyleSheet('color:#778; font-size:11px;')
+        val = QLabel(value)
+        val.setStyleSheet(f'color:{value_color}; font-size:12px; font-weight:600;')
+        grid.addWidget(lbl, row, 0)
+        grid.addWidget(val, row, 1)
+
+    def _build_ui(self, data: dict):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 14)
+        root.setSpacing(10)
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        title = QLabel('Survey Session Summary')
+        title.setStyleSheet('font-size:15px; font-weight:700; color:#9bc;')
+        root.addWidget(title)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet('color:#334;'); root.addWidget(sep)
+
+        # ── Core stats ────────────────────────────────────────────────────────
+        stats_grid = QGridLayout()
+        stats_grid.setColumnStretch(1, 1)
+        stats_grid.setHorizontalSpacing(16)
+        stats_grid.setVerticalSpacing(4)
+        self._stat_row(stats_grid, 0, 'Maps Completed', str(data['maps_completed']), '#9fc')
+        self._stat_row(stats_grid, 1, 'Start Time',     data['start_str'])
+        self._stat_row(stats_grid, 2, 'End Time',       data['end_str'])
+        self._stat_row(stats_grid, 3, 'Duration',       data['duration_str'],    '#fca')
+        self._stat_row(stats_grid, 4, 'Avg Survey Time',data['avg_time_str'],    '#fca')
+        root.addLayout(stats_grid)
+
+        # ── XP Gained (Surveying / Mining / Geology only) ────────────────────
+        xp = data.get('xp', {})
+        if xp:
+            sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
+            sep2.setStyleSheet('color:#334;'); root.addWidget(sep2)
+            root.addWidget(self._section_label('XP Gained'))
+            xp_grid = QGridLayout()
+            xp_grid.setColumnStretch(1, 1)
+            xp_grid.setHorizontalSpacing(16)
+            xp_grid.setVerticalSpacing(3)
+            for r, skill in enumerate(['Surveying', 'Mining', 'Geology']):
+                if skill in xp:
+                    self._stat_row(xp_grid, r, skill, f'{xp[skill]:,}', '#9fc')
+            root.addLayout(xp_grid)
+
+        # ── Items Found table ─────────────────────────────────────────────────
+        sep3 = QFrame(); sep3.setFrameShape(QFrame.HLine)
+        sep3.setStyleSheet('color:#334;'); root.addWidget(sep3)
+        root.addWidget(self._section_label('Items Found'))
+
+        items = data.get('items', [])
+        table = QTableWidget(len(items), 3)
+        table.setHorizontalHeaderLabels(['Item', 'Count', '% of Total'])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        table.setColumnWidth(2, 160)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(
+            self._BASE_STYLE +
+            'QTableWidget { alternate-background-color:#0d0d22; }'
+        )
+
+        max_count = max((c for _, c, _ in items), default=1)
+        for row, (name, count, pct) in enumerate(items):
+            table.setItem(row, 0, QTableWidgetItem(name))
+            count_item = QTableWidgetItem(str(count))
+            count_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row, 1, count_item)
+
+            bar = QProgressBar()
+            bar.setRange(0, max(max_count, 1))
+            bar.setValue(count)
+            bar.setFormat(f'{pct:.1f}%')
+            bar.setTextVisible(True)
+            bar.setStyleSheet(
+                'QProgressBar { background:#12122a; border:1px solid #334; '
+                '  border-radius:3px; text-align:center; color:#cde; font-size:10px; }'
+                'QProgressBar::chunk { background:#1a4a2a; border-radius:2px; }'
+            )
+            table.setCellWidget(row, 2, bar)
+
+        table.resizeRowsToContents()
+        max_visible = min(len(items), 12)
+        if max_visible > 0:
+            row_h = table.rowHeight(0)
+            header_h = table.horizontalHeader().height()
+            table.setMaximumHeight(header_h + row_h * max_visible + 4)
+        root.addWidget(table)
+
+        # ── Close button ──────────────────────────────────────────────────────
+        sep4 = QFrame(); sep4.setFrameShape(QFrame.HLine)
+        sep4.setStyleSheet('color:#334;'); root.addWidget(sep4)
+        btn_close = QPushButton('Close')
+        btn_close.setFixedWidth(90)
+        btn_close.clicked.connect(self.accept)
+        root.addWidget(btn_close, 0, Qt.AlignRight)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Control Panel
 # ─────────────────────────────────────────────────────────────────────────────
 class ControlPanel(QWidget):
@@ -1255,7 +1402,9 @@ class ControlPanel(QWidget):
         self.btn_done    = self._btn('🗺 Optimize Route',   self.app.done_surveying,   '#5a4a00')
         self.btn_next    = self._btn('→ Skip to Next',      self.app.advance_route,    '#1a3a5a')
         self.btn_reset   = self._btn('🗑 Reset',            self.app.reset_survey,     '#5a1a1a')
-        for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next, self.btn_reset):
+        self.btn_summary = self._btn('📊 View Summary',     self.app.show_summary,     '#1a3a4a')
+        for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next,
+                  self.btn_reset, self.btn_summary):
             rc_layout.addWidget(b)
         rc_layout.addStretch()
         sec.addWidget(self._regular_controls)
@@ -1403,6 +1552,9 @@ class ControlPanel(QWidget):
             )
             self.btn_next.setVisible(state.phase == 'routing')
             self.btn_reset.setVisible(has_items or state.phase != 'idle')
+            self.btn_summary.setVisible(
+                getattr(self.app, '_summary_data', None) is not None
+            )
 
         # Motherlode controls visibility and content
         self._ml_section.setVisible(ml and has_chat_dir)
@@ -1506,6 +1658,15 @@ class SurveyApp:
         self._route_lines_visible = True
         self._invert_dirs      = False
 
+        # ── Session summary tracking ──────────────────────────────────────────
+        self._survey_start_time     = None   # datetime when Optimize Route clicked
+        self._survey_end_time       = None   # datetime when last item collected
+        self._collection_timestamps = []     # datetime of each collection event
+        self._xp_gained             = {}     # skill_name -> total XP int
+        self._inv_items             = {}     # item_name -> total count (primary + bonus)
+        self._tracking_xp           = False  # True while routing session is live
+        self._summary_data          = None   # dict; set when session completes
+
         # Polling timer (0.5 s)
         self._timer = QTimer()
         self._timer.timeout.connect(self._poll)
@@ -1562,6 +1723,15 @@ class SurveyApp:
         self.state.optimise_route()
         self.state.phase     = 'routing'
         self.state.route_idx = 0
+        # ── Start session tracking ────────────────────────────────────────────
+        self._survey_start_time     = datetime.datetime.now()
+        self._survey_end_time       = None
+        self._collection_timestamps = []
+        self._xp_gained             = {}
+        self._inv_items             = {}
+        self._tracking_xp           = True
+        self._summary_data          = None
+        # ─────────────────────────────────────────────────────────────────────
         self._refresh_all()
         first = next((i for i in self.state.items if i['id'] == self.state.active_id), None)
         self._set_log(
@@ -1612,6 +1782,13 @@ class SurveyApp:
         self.control.sb_count.blockSignals(True)
         self.control.sb_count.setValue(0)
         self.control.sb_count.blockSignals(False)
+        self._survey_start_time     = None
+        self._survey_end_time       = None
+        self._collection_timestamps = []
+        self._xp_gained             = {}
+        self._inv_items             = {}
+        self._tracking_xp           = False
+        self._summary_data          = None
         self._refresh_all()
         self._set_log('Survey reset. Set your position and start a new survey.')
 
@@ -1766,12 +1943,12 @@ class SurveyApp:
 
         print(f'[collect] "{collected_name}" | phase={state.phase} | route_idx={state.route_idx}')
 
-        # Deduplicate: ignore repeated collect events for the same name within 3 s.
+        # Deduplicate: ignore repeated collect events for the same name within 0.5 s.
         # The game occasionally emits duplicate "X collected!" messages, which would
         # otherwise consume two consecutive same-named route targets from one pickup.
         now = time.monotonic()
-        if now - self._collect_last.get(name_low, 0) < 3.0:
-            print(f'[collect]   DEDUP — ignored (same name within 3 s)')
+        if now - self._collect_last.get(name_low, 0) < 0.5:
+            print(f'[collect]   DEDUP — ignored (same name within 0.5 s)')
             return
         self._collect_last[name_low] = now
 
@@ -1794,6 +1971,8 @@ class SurveyApp:
             self.map_overlay.refresh()
 
         target['collected'] = True
+        if self._tracking_xp:
+            self._collection_timestamps.append(datetime.datetime.now())
         if state.survey_count > 0:
             state.survey_count -= 1
             self.control.sb_count.blockSignals(True)
@@ -1814,6 +1993,8 @@ class SurveyApp:
                 if not remaining:
                     self._set_log('🎉 All survey items collected — surveying complete!')
                     state.phase = 'idle'
+                    self._survey_end_time = datetime.datetime.now()
+                    self._summary_data = self._build_summary_data()
                 else:
                     state.route_idx = remaining[0][0]
                     item = next((i for i in state.items if i['id'] == state.active_id), None)
@@ -2081,7 +2262,12 @@ class SurveyApp:
                     f.seek(self._chat_offset)
                     new_text = f.read()
                 self._chat_offset = size
-                for line in new_text.splitlines():
+                lines = new_text.splitlines()
+                # Populate _inv_items BEFORE the main loop so that if the last
+                # collected! line triggers _build_summary_data(), _inv_items is ready.
+                if self._tracking_xp and not self.state.ml_mode:
+                    self._track_summary_items(lines)
+                for line in lines:
                     if self.state.ml_mode:
                         dist = parse_ml_dist_line(line)
                         if dist is not None and self.state.ml_phase == 'survey' and self.state.ml_round < 3:
@@ -2103,6 +2289,15 @@ class SurveyApp:
                         name = parse_collect_line(line)
                         if name:
                             self._on_item_collected(name)
+                        if self._tracking_xp:
+                            xm = _XP_RE.search(line)
+                            if xm:
+                                skill = xm.group(2).strip()
+                                if skill.lower() in _XP_SKILLS:
+                                    amount = int(xm.group(1).replace(',', ''))
+                                    self._xp_gained[skill] = (
+                                        self._xp_gained.get(skill, 0) + amount
+                                    )
         except Exception:
             pass
 
@@ -2286,6 +2481,11 @@ class SurveyApp:
                     for e in ml.ml_surveys
                 ],
             }
+            if self._summary_data:
+                # Serialise items list (tuples → lists, fine for JSON round-trip)
+                sd = dict(self._summary_data)
+                sd['items'] = [list(row) for row in sd['items']]
+                data['summary_data'] = sd
             SETTINGS_PATH.write_text(json.dumps(data, indent=2))
         except Exception:
             pass
@@ -2424,8 +2624,98 @@ class SurveyApp:
                         and any(e.get('estimated_pos') for e in st.ml_surveys)):
                     self._ml_optimise_route()
 
+            sd = data.get('summary_data')
+            if sd:
+                # items were serialised as lists; keep as-is (SummaryWindow handles both)
+                self._summary_data = sd
+
         except Exception:
             pass
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    def _track_summary_items(self, lines: list):
+        """Update _inv_items from a batch of log lines.
+
+        For each 'collected!' line, look back in the same batch for an
+        '{item} xN added to inventory' line to get the speed-bonus quantity,
+        falling back to 1 for a normal (no-bonus) collection.  Bonus items
+        are parsed from the 'Also found X xN' tail of the collected line.
+        """
+        for i, line in enumerate(lines):
+            name = parse_collect_line(line)
+            if not name:
+                continue
+            clean = clean_name(name)
+            # Look back up to 10 lines for a quantity-specified inventory-add
+            # for the primary item (speed-bonus case: "Item xN added to inventory.")
+            primary_qty = 1
+            for prev in lines[max(0, i - 10):i]:
+                im = _INV_ADD_RE.search(prev)
+                if im and im.group(1).strip().lower() == clean.lower():
+                    primary_qty = int(im.group(2))
+                    break
+            self._inv_items[clean] = self._inv_items.get(clean, 0) + primary_qty
+            # Bonus items from "Also found X [xN] (speed bonus!)"
+            # Count is optional — missing means x1
+            for bm in _BONUS_RE.finditer(line):
+                bn = bm.group(1).strip()
+                bq = int(bm.group(2)) if bm.group(2) else 1
+                self._inv_items[bn] = self._inv_items.get(bn, 0) + bq
+
+    def _build_summary_data(self) -> dict:
+        state = self.state
+        start = self._survey_start_time
+        end   = self._survey_end_time or datetime.datetime.now()
+
+        start_str    = start.strftime('%Y-%m-%d %H:%M:%S') if start else 'N/A'
+        end_str      = end.strftime('%Y-%m-%d %H:%M:%S')   if end   else 'N/A'
+
+        if start and end:
+            total_secs = int((end - start).total_seconds())
+            h, rem     = divmod(total_secs, 3600)
+            m, s       = divmod(rem, 60)
+            duration_str = f'{h}h {m}m {s}s' if h else f'{m}m {s}s'
+        else:
+            duration_str = 'N/A'
+
+        times = self._collection_timestamps
+        if len(times) >= 2:
+            deltas  = [(times[i+1] - times[i]).total_seconds() for i in range(len(times) - 1)]
+            avg_sec = sum(deltas) / len(deltas)
+            avg_m, avg_s = divmod(int(avg_sec), 60)
+            avg_time_str = f'{avg_m}m {avg_s}s' if avg_m else f'{avg_s}s'
+        else:
+            avg_time_str = 'N/A'
+
+        # Use live inventory-add tracking for accurate counts (primary + bonus quantities).
+        # Fall back to state.items if no inv-add lines were captured (e.g. log not running).
+        if self._inv_items:
+            name_counts = Counter(self._inv_items)
+        else:
+            name_counts = Counter(clean_name(i['name']) for i in state.items if i['collected'])
+        total_items = sum(name_counts.values())
+        items = sorted(
+            [(name, count, count / total_items * 100 if total_items else 0.0)
+             for name, count in name_counts.items()],
+            key=lambda x: (-x[1], x[0])
+        )
+
+        maps_completed = sum(1 for i in state.items if i['collected'])
+
+        return {
+            'maps_completed': maps_completed,
+            'start_str':      start_str,
+            'end_str':        end_str,
+            'duration_str':   duration_str,
+            'avg_time_str':   avg_time_str,
+            'xp':             dict(self._xp_gained),
+            'items':          items,
+        }
+
+    def show_summary(self):
+        data = self._summary_data or self._build_summary_data()
+        win  = SummaryWindow(data, self.control)
+        win.exec_()
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _set_log(self, msg: str):

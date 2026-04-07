@@ -3282,6 +3282,10 @@ def _macos_raise_overlay(widget):
 
 
 def main():
+    # Enable high-DPI scaling before QApplication is created so Qt handles
+    # logical-to-physical pixel mapping on 4K / HiDPI monitors automatically.
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     _macos_activate()   # must be called after QApplication initialises Cocoa
     app.setStyle('Fusion')

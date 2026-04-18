@@ -1062,6 +1062,22 @@ class SlotWidget(QFrame):
             self.clicked.emit(self.item)
 
 
+class DummySlot(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # background
+        p.fillRect(0, 0, w, h, QColor(0, 0, 0, 200))
+        p.setPen(QPen(QColor(100, 170, 255, 150), 1))
+        p.drawRoundedRect(0, 0, w - 1, h - 1, 2, 2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Inventory Overlay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1128,19 +1144,26 @@ class InventoryOverlay(DragMixin, QWidget):
         sc    = self.state.survey_count
         total = max(sc, len(uncollected)) if sc > 0 else len(uncollected)
         if total == 0:
-            total = GRID_COLS   # show a placeholder row before any items are found
+            total = GRID_COLS - DUMMY_SLOTS  # show a placeholder row before any items are found
 
         # Compute slot width so 10 columns fill the full overlay width evenly
         slot_w = max(28, (self.width() - 12 - SLOT_GAP * (GRID_COLS - 1)) // GRID_COLS)
 
+        for d in range(DUMMY_SLOTS):
+            slot = DummySlot(self._grid_container)
+            slot.setFixedSize(slot_w, slot_w)
+            row, col = divmod(d, GRID_COLS)
+            self._grid_layout.addWidget(slot, row, col)
+            self._slots.append(slot)
+
         for i in range(total):
             item = uncollected[i] if i < len(uncollected) else None
             slot = SlotWidget(item, self._grid_container)
-            slot.setFixedSize(slot_w, slot_w)
             if item and item['id'] == active_id:
                 slot.setProperty('active_route', True)
             slot.clicked.connect(self.app.on_inventory_click)
-            row, col = divmod(i, GRID_COLS)
+            slot.setFixedSize(slot_w, slot_w)
+            row, col = divmod(i + DUMMY_SLOTS, GRID_COLS)
             self._grid_layout.addWidget(slot, row, col)
             self._slots.append(slot)
 
@@ -2750,7 +2773,7 @@ class SurveyApp:
         item = next((i for i in state.items if i['id'] == active_id), None)
         if item is None:
             return
-        grid_idx = item['grid_index']
+        grid_idx = item['grid_index'] + DUMMY_SLOTS
         slots = self.inv_overlay._slots
         if grid_idx < len(slots):
             slot = slots[grid_idx]
@@ -2933,6 +2956,7 @@ class SurveyApp:
                     'cols':      GRID_COLS,
                     'slot_size': SLOT_SIZE,
                     'slot_gap':  SLOT_GAP,
+                    'dummy_slots': DUMMY_SLOTS
                 },
             }
             st = self.state
@@ -3254,7 +3278,7 @@ class SurveyApp:
 # ─────────────────────────────────────────────────────────────────────────────
 def _apply_grid_config():
     """Load GRID_COLS / SLOT_SIZE / SLOT_GAP from settings before overlays are created."""
-    global GRID_COLS, SLOT_SIZE, SLOT_GAP
+    global GRID_COLS, SLOT_SIZE, SLOT_GAP, DUMMY_SLOTS
     try:
         if SETTINGS_PATH.exists():
             data = json.loads(SETTINGS_PATH.read_text())
@@ -3262,6 +3286,7 @@ def _apply_grid_config():
             if 'cols'      in g: GRID_COLS = max(1,  int(g['cols']))
             if 'slot_size' in g: SLOT_SIZE  = max(16, int(g['slot_size']))
             if 'slot_gap'  in g: SLOT_GAP   = max(0,  int(g['slot_gap']))
+            if 'dummy_slots' in g: DUMMY_SLOTS = max(0,  int(g['dummy_slots']))
     except Exception:
         pass
 

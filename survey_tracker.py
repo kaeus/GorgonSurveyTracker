@@ -690,7 +690,8 @@ class LockButton(QWidget):
             self.clicked.emit()
 
     def sync(self):
-        """Reposition over the parent overlay's lock area, raise above it, and repaint."""
+        """Reposition over the parent overlay's lock area and repaint. 
+        Call raise only when already visible, to avoid stealing focus on show."""
         po = self._parent_overlay
         if not po.isVisible():
             self.hide()
@@ -702,7 +703,7 @@ class LockButton(QWidget):
         self.move(top_left)
         if not self.isVisible():
             self.show()
-        self.raise_()
+            self.raise_()
         self.update()
 
 
@@ -1019,9 +1020,11 @@ class MapOverlay(DragMixin, QWidget):
         _set_click_through(int(self.winId()), enabled)
 
     def refresh(self):
+        # NOTE: do NOT call lock_btn.sync() here — refresh() is driven by the
+        # 600 ms _blink_timer, and a sync() on every tick used to trigger
+        # raise_() which steals focus from the game on X11. The lock button
+        # is re-synced only on real events (show/move/resize) below.
         self.update()
-        if hasattr(self, 'lock_btn'):
-            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1349,10 +1352,12 @@ class InventoryOverlay(DragMixin, QWidget):
         self.app.save_settings()
 
     def refresh(self):
+        # NOTE: do NOT call lock_btn.sync() here — refresh() runs on every
+        # state change; sync() used to trigger raise_() on each call, which
+        # steals focus from the game on X11. The lock button is re-synced on
+        # real events only (show/move/resize).
         self._rebuild_grid()
         self.update()
-        if hasattr(self, 'lock_btn'):
-            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

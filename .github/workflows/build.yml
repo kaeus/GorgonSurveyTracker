@@ -3,45 +3,40 @@ name: Build and Release
 on:
   push:
     branches: [ main ]
-    paths-ignore:
-      - 'version.txt'   # skip re-triggering on the version bump commit
+    paths:
+      - 'version.txt'   # only build + release when the version file is bumped
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write   # needed to push version bump and create releases
+      contents: write   # needed to create releases
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ── Version bump ────────────────────────────────────────────────────────
-      - name: Increment minor version
+      # ── Read version ────────────────────────────────────────────────────────
+      - name: Read version
         id: version
         shell: bash
         run: |
-          VERSION=$(cat version.txt)
-          MAJOR=$(echo "$VERSION" | cut -d. -f1)
-          MINOR=$(echo "$VERSION" | cut -d. -f2)
-          PATCH=$(echo "$VERSION" | cut -d. -f3)
-          NEW_MINOR=$((MINOR + 1))
-          NEW_VERSION="$MAJOR.$NEW_MINOR.$PATCH"
-          echo "$NEW_VERSION" > version.txt
-          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$NEW_VERSION"    >> "$GITHUB_OUTPUT"
+          VERSION=$(tr -d '[:space:]' < version.txt)
+          if [ -z "$VERSION" ]; then
+            echo "::error::version.txt is empty"
+            exit 1
+          fi
+          echo "version=$VERSION"    >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"       >> "$GITHUB_OUTPUT"
 
       # ── Build ───────────────────────────────────────────────────────────────
       - name: Install dependencies
-        run: pip install PyQt5 pyinstaller pynput
+        run: pip install PyQt5 pyinstaller pynput mss numpy opencv-python-headless
 
       - name: Build executable
         run: >
@@ -53,15 +48,6 @@ jobs:
           survey_tracker.py
 
       # ── Publish ─────────────────────────────────────────────────────────────
-      - name: Commit version bump
-        shell: bash
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add version.txt
-          git commit -m "chore: bump version to ${{ steps.version.outputs.version }}"
-          git push
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

@@ -56,6 +56,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QVBoxLayout, QHBoxLayout, QFrame, QGroupBox,
     QFileDialog, QMessageBox, QSizeGrip, QProgressDialog,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
+    QSizePolicy
 )
 from PyQt5.QtCore  import Qt, QTimer, QPoint, QSize, pyqtSignal, QObject
 from PyQt5.QtGui   import (
@@ -1025,6 +1026,8 @@ class MapOverlay(DragMixin, QWidget):
         # raise_() which steals focus from the game on X11. The lock button
         # is re-synced only on real events (show/move/resize) below.
         self.update()
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1174,6 +1177,22 @@ class SlotWidget(QFrame):
             self.clicked.emit(self.item)
 
 
+class DummySlot(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # background
+        p.fillRect(0, 0, w, h, QColor(0, 0, 0, 200))
+        p.setPen(QPen(QColor(100, 170, 255, 150), 1))
+        p.drawRoundedRect(0, 0, w - 1, h - 1, 2, 2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Inventory Overlay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1244,19 +1263,26 @@ class InventoryOverlay(DragMixin, QWidget):
         sc    = self.state.survey_count
         total = max(sc, len(uncollected)) if sc > 0 else len(uncollected)
         if total == 0:
-            total = GRID_COLS   # show a placeholder row before any items are found
+            total = GRID_COLS - self.app._offset_slots  # show a placeholder row before any items are found
 
         # Compute slot width so 10 columns fill the full overlay width evenly
         slot_w = max(28, (self.width() - 12 - SLOT_GAP * (GRID_COLS - 1)) // GRID_COLS)
 
+        for d in range(self.app._offset_slots):
+            slot = DummySlot(self._grid_container)
+            slot.setFixedSize(slot_w, slot_w)
+            row, col = divmod(d, GRID_COLS)
+            self._grid_layout.addWidget(slot, row, col)
+            self._slots.append(slot)
+
         for i in range(total):
             item = uncollected[i] if i < len(uncollected) else None
             slot = SlotWidget(item, self._grid_container)
-            slot.setFixedSize(slot_w, slot_w)
             if item and item['id'] == active_id:
                 slot.setProperty('active_route', True)
             slot.clicked.connect(self.app.on_inventory_click)
-            row, col = divmod(i, GRID_COLS)
+            slot.setFixedSize(slot_w, slot_w)
+            row, col = divmod(i + self.app._offset_slots, GRID_COLS)
             self._grid_layout.addWidget(slot, row, col)
             self._slots.append(slot)
 
@@ -1358,6 +1384,8 @@ class InventoryOverlay(DragMixin, QWidget):
         # real events only (show/move/resize).
         self._rebuild_grid()
         self.update()
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1727,7 +1755,11 @@ class ControlPanel(QWidget):
 
         # ── Survey controls (regular mode) ───────────────────────────────
         self._regular_controls = QWidget()
-        rc_layout = QHBoxLayout(self._regular_controls)
+        self._regular_controls.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        vert_layout = QVBoxLayout(self._regular_controls)
+        vert_layout.setContentsMargins(0, 0, 0, 0)
+        vert_layout.setSpacing(3)
+        rc_layout = QHBoxLayout()
         rc_layout.setContentsMargins(0, 0, 0, 0)
         rc_layout.addWidget(self._label('Surveys:'))
         self.sb_count = QSpinBox()
@@ -1753,6 +1785,26 @@ class ControlPanel(QWidget):
         for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next, self.btn_mark, self.btn_reset, self.btn_summary):
             rc_layout.addWidget(b)
         rc_layout.addStretch()
+        vert_layout.addLayout(rc_layout)
+        # ── Add selector for empty offset control ───────────
+        oc_layout = QHBoxLayout()
+        oc_layout.setContentsMargins(0, 0, 0, 0)
+        oc_layout.addWidget(self._label('1st Row Offset:'))
+        self.offset_count = QSpinBox()
+        self.offset_count.setRange(0, GRID_COLS - 1)
+        self.offset_count.setValue(0)
+        self.offset_count.setSpecialValueText('0')
+        self.offset_count.setToolTip('How many inventory slots to offset in the first row?')
+        self.offset_count.setMaximumWidth(60)
+        self.offset_count.setStyleSheet(
+            'QSpinBox { background:#1a1a2e; color:#cde; border:1px solid #446; '
+            'padding:2px 4px; border-radius:4px; font-size:12px; }'
+            'QSpinBox::up-button, QSpinBox::down-button { width:14px; }'
+        )
+        self.offset_count.valueChanged.connect(self.app.on_offset_count_changed)
+        oc_layout.addWidget(self.offset_count)
+        oc_layout.addStretch()
+        vert_layout.addLayout(oc_layout)
         sec.addWidget(self._regular_controls)
 
         # ── Motherlode controls (shown only in motherlode mode) ───────────
@@ -2099,6 +2151,7 @@ class SurveyApp:
         self._latest_version       = None
         self._latest_download_url  = None
         self._skip_update_version  = None
+        self._offset_slots = 0
 
         self.map_overlay  = MapOverlay(self.state, self)
         self.inv_overlay  = InventoryOverlay(self.state, self)
@@ -3048,7 +3101,7 @@ class SurveyApp:
         item = next((i for i in state.items if i['id'] == active_id), None)
         if item is None:
             return
-        grid_idx = item['grid_index']
+        grid_idx = item['grid_index'] + self._offset_slots
         slots = self.inv_overlay._slots
         if grid_idx < len(slots):
             slot = slots[grid_idx]
@@ -3063,7 +3116,7 @@ class SurveyApp:
 
     def _click_next_survey_slot(self):
         """Double-click the next empty inventory slot during the surveying phase."""
-        next_idx = len(self.state.uncollected())
+        next_idx = len(self.state.uncollected()) + self._offset_slots
         slots = self.inv_overlay._slots
         if next_idx < len(slots):
             slot = slots[next_idx]
@@ -3130,6 +3183,11 @@ class SurveyApp:
 
     def on_survey_count_changed(self, value: int):
         self.state.survey_count = value
+        self.inv_overlay.refresh()
+        self.save_settings()
+
+    def on_offset_count_changed(self, value: int):
+        self._offset_slots = value
         self.inv_overlay.refresh()
         self.save_settings()
 

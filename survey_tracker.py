@@ -26,6 +26,10 @@ import time
 import ctypes
 import threading
 import datetime
+import subprocess
+import tempfile
+import webbrowser
+import urllib.request
 
 # ── pynput — optional cross-platform input library ────────────────────────────
 try:
@@ -49,9 +53,10 @@ from pathlib import Path
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QSlider, QSpinBox,
-    QGridLayout, QVBoxLayout, QHBoxLayout, QFrame,
-    QFileDialog, QMessageBox, QSizeGrip,
+    QGridLayout, QVBoxLayout, QHBoxLayout, QFrame, QGroupBox,
+    QFileDialog, QMessageBox, QSizeGrip, QProgressDialog,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
+    QSizePolicy
 )
 from PyQt5.QtCore  import Qt, QTimer, QPoint, QSize, pyqtSignal, QObject
 from PyQt5.QtGui   import (
@@ -65,7 +70,6 @@ GRID_COLS   = 10
 GRID_ROWS   = 8
 SLOT_SIZE   = 50          # px
 SLOT_GAP    = 2           # px
-DUMMY_SLOTS = 0
 HEADER_H    = 28          # px — header height for both overlays
 
 # Qt.Key_* → human-readable label (platform-neutral; used by HotkeyCaptureDialog)
@@ -163,6 +167,32 @@ _ver_file = _resource_path("version.txt")
 APP_VERSION = _ver_file.read_text().strip() if _ver_file.exists() else "dev"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Update check — queries GitHub Releases for a newer version.
+# ─────────────────────────────────────────────────────────────────────────────
+_UPDATE_REPO       = "kaeus/GorgonSurveyTracker"
+_UPDATE_API_URL    = f"https://api.github.com/repos/{_UPDATE_REPO}/releases/latest"
+_UPDATE_PAGE_URL   = f"https://github.com/{_UPDATE_REPO}/releases/latest"
+_UPDATE_ASSET_NAME = "GorgonSurveyTracker.exe"
+
+
+def _parse_version(s):
+    """Parse 'v1.20.0' / '1.20.0' → (1, 20, 0). Returns (0,0,0) for unparseable strings like 'dev'."""
+    if not s:
+        return (0, 0, 0)
+    s = s.strip().lstrip('vV')
+    parts = []
+    for p in s.split('.'):
+        m = re.match(r'(\d+)', p)
+        if not m:
+            return (0, 0, 0) if not parts else tuple(parts)
+        parts.append(int(m.group(1)))
+    return tuple(parts) if parts else (0, 0, 0)
+
+
+def _is_frozen_windows():
+    return sys.platform == 'win32' and getattr(sys, 'frozen', False)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Log-parsing helpers
 # ─────────────────────────────────────────────────────────────────────────────
 _DIST_RE         = re.compile(r'(\d+(?:\.\d+)?)m\s+(west|east|north|south)', re.IGNORECASE)
@@ -174,6 +204,17 @@ _XP_RE           = re.compile(r'\[Status\]\s+You earned ([\d,]+) XP in (.+?)\.',
 _INV_ADD_RE      = re.compile(r'\[Status\]\s+(.+?)\s+x(\d+)\s+added to inventory\.', re.IGNORECASE)
 _BONUS_RE        = re.compile(r'Also found (.+?)(?:\s+x(\d+))?\s+\(speed bonus', re.IGNORECASE)
 _XP_SKILLS       = frozenset({'surveying', 'mining', 'geology'})
+_ENTER_AREA_RE   = re.compile(r'\*{3,}\s*Entering Area:\s*(.+?)\s*$')
+
+# Zones whose in-game coordinates are reversed relative to the map image.
+# Flip Dirs auto-toggles ON when entering one of these, OFF otherwise.
+FLIPPED_ZONES    = frozenset({'Kur Mountains'})
+
+
+def parse_enter_area_line(line: str):
+    """Return the area name from an 'Entering Area:' chat line, or None."""
+    m = _ENTER_AREA_RE.search(line)
+    return m.group(1).strip() if m else None
 
 
 def parse_chat_survey_line(line: str):
@@ -619,6 +660,53 @@ def _draw_lock_icon(p: QPainter, cx: int, cy: int, locked: bool):
     p.restore()
 
 
+class LockButton(QWidget):
+    """Small always-on-top window that draws the lock icon and stays clickable
+    even when its parent overlay has pass-through enabled.
+
+    Positioned over the parent overlay's header via sync().
+    """
+    SIZE = 24
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent_overlay, state_getter):
+        super().__init__()
+        self._parent_overlay = parent_overlay
+        self._state_getter   = state_getter  # callable → bool (locked?)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        if sys.platform == 'darwin':
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        _draw_lock_icon(p, self.SIZE // 2, self.SIZE // 2, self._state_getter())
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+
+    def sync(self):
+        """Reposition over the parent overlay's lock area, raise above it, and repaint."""
+        po = self._parent_overlay
+        if not po.isVisible():
+            self.hide()
+            return
+        icon_cx = po.width() - 14
+        icon_cy = HEADER_H // 2
+        top_left = po.mapToGlobal(QPoint(icon_cx - self.SIZE // 2,
+                                         icon_cy - self.SIZE // 2))
+        self.move(top_left)
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.update()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Map Overlay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -650,6 +738,10 @@ class MapOverlay(DragMixin, QWidget):
         self._grip = ResizeGrip(self)
         self._grip.move(self.width() - ResizeGrip.SIZE, self.height() - ResizeGrip.SIZE)
 
+        # Floating lock button — stays clickable even when pass-through is on
+        self.lock_btn = LockButton(self, lambda: not self._click_through)
+        self.lock_btn.clicked.connect(lambda: self.app.toggle_map_click_through())
+
     # ── geometry helpers ─────────────────────────────────────────────────────
     @property
     def canvas_h(self):
@@ -677,9 +769,7 @@ class MapOverlay(DragMixin, QWidget):
         p.setFont(QFont('Segoe UI', 9, QFont.Bold))
         p.drawText(8, 0, w - 30, HEADER_H, Qt.AlignVCenter, 'Survey Map')
 
-        # lock / pass-through indicator
-        # closed = overlay is interactive (capturing clicks); open = clicks pass through
-        _draw_lock_icon(p, w - 14, HEADER_H // 2, not self._click_through)
+        # lock icon is drawn by the floating LockButton window (see self.lock_btn)
 
         # ── canvas background ──
         cy = HEADER_H
@@ -692,7 +782,7 @@ class MapOverlay(DragMixin, QWidget):
         # ── route lines ──
         if (self.app._route_lines_visible
                 and self.state.phase == 'routing' and len(self.state.route_order) >= 1):
-            pen = QPen(QColor(255, 210, 50, 210), 2.5, Qt.DashLine)
+            pen = QPen(QColor(255, 210, 50, int(self.app._route_alpha * 255)), 2.5, Qt.DashLine)
             pen.setDashPattern([6, 3])
             p.setPen(pen)
             pts = []
@@ -829,7 +919,7 @@ class MapOverlay(DragMixin, QWidget):
 
         # ── Route lines (dashed yellow, last position → estimated targets in order) ──
         if self.app._route_lines_visible and state.ml_route_order and state.ml_positions:
-            pen = QPen(QColor(255, 210, 50, 210), 2.5, Qt.DashLine)
+            pen = QPen(QColor(255, 210, 50, int(self.app._route_alpha * 255)), 2.5, Qt.DashLine)
             pen.setDashPattern([6, 3])
             p.setPen(pen)
             pts = []
@@ -887,6 +977,23 @@ class MapOverlay(DragMixin, QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._grip.move(self.width() - ResizeGrip.SIZE, self.height() - ResizeGrip.SIZE)
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.hide()
 
     # ── mouse events ─────────────────────────────────────────────────────────
     def mousePressEvent(self, event):
@@ -914,6 +1021,8 @@ class MapOverlay(DragMixin, QWidget):
 
     def refresh(self):
         self.update()
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1109,6 +1218,10 @@ class InventoryOverlay(DragMixin, QWidget):
         self._grip.move(self.width() - ResizeGrip.SIZE, self.height() - ResizeGrip.SIZE)
         self._grip.raise_()
 
+        # Floating lock button — stays clickable even when inv is locked (pass-through)
+        self.lock_btn = LockButton(self, lambda: self.app._inv_locked)
+        self.lock_btn.clicked.connect(lambda: self.app.toggle_inv_lock())
+
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1128,7 +1241,6 @@ class InventoryOverlay(DragMixin, QWidget):
         self._rebuild_grid()
 
     def _rebuild_grid(self):
-        global GRID_COLS, SLOT_SIZE, SLOT_GAP, DUMMY_SLOTS
         # Clear old slots
         while self._grid_layout.count():
             w = self._grid_layout.takeAt(0).widget()
@@ -1146,12 +1258,12 @@ class InventoryOverlay(DragMixin, QWidget):
         sc    = self.state.survey_count
         total = max(sc, len(uncollected)) if sc > 0 else len(uncollected)
         if total == 0:
-            total = GRID_COLS - DUMMY_SLOTS  # show a placeholder row before any items are found
+            total = GRID_COLS - self.app._offset_slots  # show a placeholder row before any items are found
 
         # Compute slot width so 10 columns fill the full overlay width evenly
         slot_w = max(28, (self.width() - 12 - SLOT_GAP * (GRID_COLS - 1)) // GRID_COLS)
 
-        for d in range(DUMMY_SLOTS):
+        for d in range(self.app._offset_slots):
             slot = DummySlot(self._grid_container)
             slot.setFixedSize(slot_w, slot_w)
             row, col = divmod(d, GRID_COLS)
@@ -1165,7 +1277,7 @@ class InventoryOverlay(DragMixin, QWidget):
                 slot.setProperty('active_route', True)
             slot.clicked.connect(self.app.on_inventory_click)
             slot.setFixedSize(slot_w, slot_w)
-            row, col = divmod(i + DUMMY_SLOTS, GRID_COLS)
+            row, col = divmod(i + self.app._offset_slots, GRID_COLS)
             self._grid_layout.addWidget(slot, row, col)
             self._slots.append(slot)
 
@@ -1219,8 +1331,7 @@ class InventoryOverlay(DragMixin, QWidget):
         title = 'Motherlode Survey' if self.state.ml_mode else 'Survey Inventory'
         p.drawText(8, 0, w - 30, HEADER_H, Qt.AlignVCenter, title)
 
-        # lock / inventory-locked indicator
-        _draw_lock_icon(p, w - 14, HEADER_H // 2, self.app._inv_locked)
+        # lock icon is drawn by the floating LockButton window (see self.lock_btn)
 
         # border
         p.setPen(QPen(QColor(100, 170, 255, 180), 1.5))
@@ -1240,6 +1351,23 @@ class InventoryOverlay(DragMixin, QWidget):
         self._grip.move(self.width() - ResizeGrip.SIZE, self.height() - ResizeGrip.SIZE)
         if hasattr(self, '_grid_layout'):
             self._rebuild_grid()
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.hide()
 
     def _on_drag_finished(self):
         self.app.save_settings()
@@ -1247,6 +1375,8 @@ class InventoryOverlay(DragMixin, QWidget):
     def refresh(self):
         self._rebuild_grid()
         self.update()
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1504,6 +1634,29 @@ class ControlPanel(QWidget):
             f'QPushButton:disabled {{ background:#222; color:#555; }}'
         )
 
+    def _small_btn_style(self, bg: str) -> str:
+        return (
+            f'QPushButton {{ background:{bg}; color:#cde; border:1px solid #446; '
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ background: #2a3a5a; }}'
+            f'QPushButton:disabled {{ background:#222; color:#555; }}'
+        )
+
+    def refresh_update_button(self):
+        """Show the clickable 'New Version' text only when a new (non-skipped) version has been detected."""
+        latest  = getattr(self.app, '_latest_version', None)
+        skipped = getattr(self.app, '_skip_update_version', None)
+        print(f'Latest version: {latest}, skipped version: {skipped}')
+        new_available = bool(
+            latest
+            and _parse_version(latest) > _parse_version(APP_VERSION)
+            and latest != skipped
+        )
+        if new_available:
+            self.btn_update.setText(f'🔔 New Version v{latest}')
+            self.btn_update.setToolTip(f'Click to update to v{latest}.')
+        self.btn_update.setVisible(new_available)
+
     def _build_ui(self):
         self.setStyleSheet('QWidget { background:#0e0e1e; color:#cde; }')
         main = QVBoxLayout(self)
@@ -1516,13 +1669,33 @@ class ControlPanel(QWidget):
         title.setStyleSheet('font-size:14px; font-weight:700; color:#9bc;')
         row_title.addWidget(title)
         row_title.addStretch()
-        self.btn_labels      = self._small_btn('Labels: Name', self.app.toggle_map_labels, '#1a2a3a')
-        row_title.addWidget(self.btn_labels)
-        self.btn_route_lines = self._small_btn('Route: ON', self.app.toggle_route_lines, '#1a2a3a')
-        row_title.addWidget(self.btn_route_lines)
-        self.btn_overlays = self._small_btn('Overlays: ON', self.app.toggle_overlays, '#1a3a1a')
-        row_title.addWidget(self.btn_overlays)
+        self.btn_update = QPushButton('New Version')
+        self.btn_update.setCursor(Qt.PointingHandCursor)
+        self.btn_update.setFlat(True)
+        self.btn_update.setStyleSheet(
+            'QPushButton { background:transparent; border:none; color:#f0a020; '
+            'font-size:12px; font-weight:700; padding:0 4px; }'
+            'QPushButton:hover { color:#ffc040; text-decoration:underline; }'
+        )
+        self.btn_update.clicked.connect(self.app._on_update_button_click)
+        self.btn_update.setVisible(False)
+        row_title.addWidget(self.btn_update)
         main.addLayout(row_title)
+
+        # (Toggles — Labels / Route / Overlays are constructed later in the Toggles group)
+        self.btn_labels      = self._small_btn('Labels: Name', self.app.toggle_map_labels, '#1a2a3a')
+        self.btn_route_lines = self._small_btn('Route: ON',    self.app.toggle_route_lines, '#1a2a3a')
+        self.btn_overlays    = self._small_btn('Overlays: ON', self.app.toggle_overlays,    '#1a3a1a')
+        self.btn_labels.setToolTip(
+            'Cycles between display options for labelling the points on the '
+            'map as you survey.'
+        )
+        self.btn_route_lines.setToolTip(
+            'Toggles the route lines that guide you once a path has been set.'
+        )
+        self.btn_overlays.setToolTip(
+            'Toggles visibility of the map and inventory overlays.'
+        )
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet('color:#334;')
@@ -1573,7 +1746,11 @@ class ControlPanel(QWidget):
 
         # ── Survey controls (regular mode) ───────────────────────────────
         self._regular_controls = QWidget()
-        rc_layout = QHBoxLayout(self._regular_controls)
+        self._regular_controls.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        vert_layout = QVBoxLayout(self._regular_controls)
+        vert_layout.setContentsMargins(0, 0, 0, 0)
+        vert_layout.setSpacing(3)
+        rc_layout = QHBoxLayout()
         rc_layout.setContentsMargins(0, 0, 0, 0)
         rc_layout.addWidget(self._label('Surveys:'))
         self.sb_count = QSpinBox()
@@ -1599,6 +1776,26 @@ class ControlPanel(QWidget):
         for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next, self.btn_mark, self.btn_reset, self.btn_summary):
             rc_layout.addWidget(b)
         rc_layout.addStretch()
+        vert_layout.addLayout(rc_layout)
+        # ── Add selector for empty offset control ───────────
+        oc_layout = QHBoxLayout()
+        oc_layout.setContentsMargins(0, 0, 0, 0)
+        oc_layout.addWidget(self._label('1st Row Offset:'))
+        self.offset_count = QSpinBox()
+        self.offset_count.setRange(0, GRID_COLS - 1)
+        self.offset_count.setValue(0)
+        self.offset_count.setSpecialValueText('0')
+        self.offset_count.setToolTip('How many inventory slots to offset in the first row?')
+        self.offset_count.setMaximumWidth(60)
+        self.offset_count.setStyleSheet(
+            'QSpinBox { background:#1a1a2e; color:#cde; border:1px solid #446; '
+            'padding:2px 4px; border-radius:4px; font-size:12px; }'
+            'QSpinBox::up-button, QSpinBox::down-button { width:14px; }'
+        )
+        self.offset_count.valueChanged.connect(self.app.on_offset_count_changed)
+        oc_layout.addWidget(self.offset_count)
+        oc_layout.addStretch()
+        vert_layout.addLayout(oc_layout)
         sec.addWidget(self._regular_controls)
 
         # ── Motherlode controls (shown only in motherlode mode) ───────────
@@ -1630,9 +1827,21 @@ class ControlPanel(QWidget):
 
         sec.addWidget(self._ml_section)
 
-        # ── Opacity (stacked) + toggle buttons ───────────────────────────
-        slider_col = QVBoxLayout()
+
+        # ── Opacity group + Toggles group ──────────────────────────────────
+        _group_style = (
+            'QGroupBox { color:#8ab; font-size:11px; font-weight:600; '
+            'border:1px solid #334; border-radius:4px; '
+            'margin-top:8px; padding:6px 6px 4px 6px; } '
+            'QGroupBox::title { subcontrol-origin:margin; '
+            'subcontrol-position: top left; left:8px; padding:0 4px; }'
+        )
+
+        grp_opacity = QGroupBox('Opacity')
+        grp_opacity.setStyleSheet(_group_style)
+        slider_col = QVBoxLayout(grp_opacity)
         slider_col.setSpacing(3)
+        slider_col.setContentsMargins(8, 4, 8, 4)
 
         row_ms = QHBoxLayout()
         row_ms.addWidget(self._label('Map:'))
@@ -1656,19 +1865,62 @@ class ControlPanel(QWidget):
         row_is.addWidget(self.sl_inv_opacity)
         slider_col.addLayout(row_is)
 
-        row4 = QHBoxLayout()
-        row4.addLayout(slider_col)
-        row4.addSpacing(10)
+        row_rs = QHBoxLayout()
+        row_rs.addWidget(self._label('Route:'))
+        self.sl_route_opacity = QSlider(Qt.Horizontal)
+        self.sl_route_opacity.setRange(10, 100)
+        self.sl_route_opacity.setValue(82)
+        self.sl_route_opacity.setMaximumWidth(100)
+        self.sl_route_opacity.valueChanged.connect(self.app.set_route_opacity)
+        row_rs.addWidget(self.sl_route_opacity)
+        slider_col.addLayout(row_rs)
+
+        grp_toggles = QGroupBox('Toggles')
+        grp_toggles.setStyleSheet(_group_style)
+        toggles_row = QHBoxLayout(grp_toggles)
+        toggles_row.setSpacing(6)
+        toggles_row.setContentsMargins(8, 4, 8, 4)
+
+        toggles_col1 = QVBoxLayout()
+        toggles_col1.setSpacing(3)
+        toggles_col2 = QVBoxLayout()
+        toggles_col2.setSpacing(3)
+
         self.btn_click_through = self._small_btn('Map Pass-Thru: OFF',
                                                  self.app.toggle_map_click_through, '#3a2a0a')
-        row4.addWidget(self.btn_click_through)
-        row4.addSpacing(4)
+        self.btn_click_through.setToolTip(
+            'Turning this off allows you to interact with the overlay to set '
+            'your position and calibrate the points.'
+        )
+        toggles_col1.addWidget(self.btn_click_through)
+
         self.btn_inv_lock = self._small_btn('Inv: Unlocked',
                                             self.app.toggle_inv_lock, '#1a3a1a')
-        row4.addWidget(self.btn_inv_lock)
-        row4.addSpacing(4)
-        self.btn_invert_dirs = self._small_btn('Flip Dirs: OFF', self.app.toggle_invert_dirs, '#3a1a3a')
-        row4.addWidget(self.btn_invert_dirs)
+        self.btn_inv_lock.setToolTip(
+            'Locking this allows you to interact with the inventory slots '
+            'once you have positioned the window.'
+        )
+        toggles_col1.addWidget(self.btn_inv_lock)
+
+        self.btn_invert_dirs = self._small_btn('Flip Dirs: OFF',
+                                               self.app.toggle_invert_dirs, '#3a1a3a')
+        self.btn_invert_dirs.setToolTip(
+            'Used for areas like Kur Mountains where surveying returns inverted directions.'
+            '\nWill be auto set if we can detect your location in such an area based on the chat logs.'
+        )
+        toggles_col1.addWidget(self.btn_invert_dirs)
+
+        toggles_col2.addWidget(self.btn_labels)
+        toggles_col2.addWidget(self.btn_route_lines)
+        toggles_col2.addWidget(self.btn_overlays)
+
+        toggles_row.addLayout(toggles_col1)
+        toggles_row.addLayout(toggles_col2)
+
+        row4 = QHBoxLayout()
+        row4.addWidget(grp_opacity)
+        row4.addSpacing(10)
+        row4.addWidget(grp_toggles)
         row4.addStretch()
         sec.addLayout(row4)
 
@@ -1837,11 +2089,62 @@ class _HotkeySignalBridge(QObject):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Update checker (worker thread → Qt main thread)
+# ─────────────────────────────────────────────────────────────────────────────
+class _UpdateChecker(QObject):
+    """Queries GitHub Releases in a daemon thread and emits the result on the main thread."""
+    result = pyqtSignal(dict)
+
+    def check(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def _run(self):
+        try:
+            req = urllib.request.Request(
+                _UPDATE_API_URL,
+                headers={
+                    'User-Agent': f'GorgonSurveyTracker/{APP_VERSION}',
+                    'Accept':     'application/vnd.github+json',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            tag = (data.get('tag_name') or '').strip()
+            dl  = None
+            for asset in data.get('assets', []) or []:
+                if asset.get('name') == _UPDATE_ASSET_NAME:
+                    dl = asset.get('browser_download_url')
+                    break
+            latest = tag.lstrip('vV') if tag else None
+            self.result.emit({
+                'ok':           bool(latest),
+                'latest':       latest,
+                'download_url': dl,
+                'error':        None if latest else 'No tag_name in response',
+            })
+        except Exception as e:
+            self.result.emit({
+                'ok':           False,
+                'latest':       None,
+                'download_url': None,
+                'error':        f'{type(e).__name__}: {e}',
+            })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main Application
 # ─────────────────────────────────────────────────────────────────────────────
 class SurveyApp:
     def __init__(self):
         self.state = SurveyState()
+
+        # Update-check state (must exist before ControlPanel._build_ui reads it via refresh_update_button).
+        self._latest_version       = None
+        self._latest_download_url  = None
+        self._skip_update_version  = None
+
+        self._offset_slots = 0
 
         self.map_overlay  = MapOverlay(self.state, self)
         self.inv_overlay  = InventoryOverlay(self.state, self)
@@ -1858,6 +2161,7 @@ class SurveyApp:
         self._inv_locked       = False
         self._overlays_visible    = True
         self._route_lines_visible = True
+        self._route_alpha         = 0.82   # 0.0–1.0; applied to route-line pen
         self._invert_dirs      = False
         # ── Session summary tracking ──────────────────────────────────────────
         self._survey_start_time     = None   # datetime when Optimize Route clicked
@@ -1867,7 +2171,6 @@ class SurveyApp:
         self._inv_items             = {}     # item_name -> total count (primary + bonus)
         self._tracking_xp           = False  # True while routing session is live
         self._summary_data          = None   # dict; set when session completes
-        self.toggle_overlay_keybind = 'm'
 
         # Polling timer (0.5 s)
         self._timer = QTimer()
@@ -1904,12 +2207,23 @@ class SurveyApp:
 
         self._load_settings()
         self.control.refresh()  # update section visibility after settings are loaded
+        self.control.refresh_update_button()
 
-        self.map_overlay.show()
-        self.inv_overlay.show()
+        # Update checker: initial check shortly after startup, then every 5 minutes.
+        self._update_checker = _UpdateChecker()
+        self._update_checker.result.connect(self._on_update_check_result)
+        self._cleanup_stale_update_files()
+        QTimer.singleShot(1000, self._check_for_updates)
+        self._update_timer = QTimer()
+        self._update_timer.timeout.connect(self._check_for_updates)
+        self._update_timer.start(5 * 60 * 1000)
+
+        if self._overlays_visible:
+            self.map_overlay.show()
+            self.inv_overlay.show()
+            _macos_raise_overlay(self.map_overlay)
+            _macos_raise_overlay(self.inv_overlay)
         self.control.show()
-        _macos_raise_overlay(self.map_overlay)
-        _macos_raise_overlay(self.inv_overlay)
 
     # ── file selection ────────────────────────────────────────────────────────
     def select_chat_dir(self):
@@ -2515,6 +2829,7 @@ class SurveyApp:
                 if latest:
                     self._chat_file   = latest
                     self._chat_offset = latest.stat().st_size  # start from end
+                    self._apply_last_known_zone()
 
             if not self._chat_file:
                 return
@@ -2536,6 +2851,9 @@ class SurveyApp:
                 if self._tracking_xp and not self.state.ml_mode:
                     self._track_summary_items(lines)
                 for line in lines:
+                    area = parse_enter_area_line(line)
+                    if area is not None:
+                        self._apply_zone_flip(area)
                     if self.state.ml_mode:
                         dist = parse_ml_dist_line(line)
                         if dist is not None and self.state.ml_phase == 'survey' and self.state.ml_round < 3:
@@ -2776,7 +3094,7 @@ class SurveyApp:
         item = next((i for i in state.items if i['id'] == active_id), None)
         if item is None:
             return
-        grid_idx = item['grid_index'] + DUMMY_SLOTS
+        grid_idx = item['grid_index'] + self._offset_slots
         slots = self.inv_overlay._slots
         if grid_idx < len(slots):
             slot = slots[grid_idx]
@@ -2791,7 +3109,7 @@ class SurveyApp:
 
     def _click_next_survey_slot(self):
         """Double-click the next empty inventory slot during the surveying phase."""
-        next_idx = len(self.state.uncollected()) + DUMMY_SLOTS
+        next_idx = len(self.state.uncollected()) + self._offset_slots
         slots = self.inv_overlay._slots
         if next_idx < len(slots):
             slot = slots[next_idx]
@@ -2851,8 +3169,18 @@ class SurveyApp:
             self.inv_overlay.refresh()
         self.save_settings()
 
+    def set_route_opacity(self, value: int):
+        self._route_alpha = value / 100.0
+        self.map_overlay.refresh()
+        self.save_settings()
+
     def on_survey_count_changed(self, value: int):
         self.state.survey_count = value
+        self.inv_overlay.refresh()
+        self.save_settings()
+
+    def on_offset_count_changed(self, value: int):
+        self._offset_slots = value
         self.inv_overlay.refresh()
         self.save_settings()
 
@@ -2917,6 +3245,43 @@ class SurveyApp:
         self._recompute_dot_positions()
         self.save_settings()
 
+    def _apply_last_known_zone(self):
+        """Scan recent ChatLogs for the most recent 'Entering Area:' line and
+        apply it, so Flip Dirs is correct on startup even if the user missed
+        the live zone-transition message. Skipped when survey points already
+        exist on the map — flipping dirs would mis-place them."""
+        if not self._chat_dir:
+            return
+        if self.state.items or self.state.ml_surveys:
+            return
+        try:
+            chat_dir = Path(self._chat_dir)
+            logs = sorted(chat_dir.glob('*.log'),
+                          key=lambda p: p.stat().st_mtime,
+                          reverse=True)
+        except Exception:
+            return
+        for p in logs:
+            try:
+                with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.read().splitlines()
+            except Exception:
+                continue
+            for line in reversed(lines):
+                area = parse_enter_area_line(line)
+                if area is not None:
+                    self._apply_zone_flip(area)
+                    return
+
+    def _apply_zone_flip(self, area_name: str):
+        """Auto-set Flip Dirs based on the area the player just entered."""
+        should_flip = area_name in FLIPPED_ZONES
+        if should_flip == self._invert_dirs:
+            return
+        self._invert_dirs = should_flip
+        self._recompute_dot_positions()
+        self.save_settings()
+
     def _recompute_dot_positions(self):
         """Re-run player_to_pixel for all auto-placed items using current inversion flag."""
         cw = self.map_overlay.width()
@@ -2954,13 +3319,12 @@ class SurveyApp:
                 'map_click_through': self._click_through,
                 'overlays_visible':     self._overlays_visible,
                 'route_lines_visible':  self._route_lines_visible,
+                'route_alpha':          int(self._route_alpha * 100),
                 'invert_dirs':          self._invert_dirs,
                 'grid': {
-                    'cols':      GRID_COLS,
-                    'slot_size': SLOT_SIZE,
-                    'slot_gap':  SLOT_GAP,
-                    'dummy_slots': DUMMY_SLOTS
+                    'cols':      GRID_COLS
                 },
+                'skip_update_version': self._skip_update_version,
             }
             st = self.state
             data['survey_state'] = {
@@ -3037,8 +3401,9 @@ class SurveyApp:
             # Sync slider / spinbox values (block signals to avoid triggering save_settings
             # before log_path / chat_dir have been restored)
             for sl, val in (
-                (self.control.sl_map_opacity, int(self.map_overlay._bg_alpha * 100)),
-                (self.control.sl_inv_opacity, int(self.inv_overlay._bg_alpha * 100)),
+                (self.control.sl_map_opacity,   int(self.map_overlay._bg_alpha * 100)),
+                (self.control.sl_inv_opacity,   int(self.inv_overlay._bg_alpha * 100)),
+                (self.control.sl_route_opacity, int(self._route_alpha * 100)),
             ):
                 sl.blockSignals(True)
                 sl.setValue(val)
@@ -3105,6 +3470,13 @@ class SurveyApp:
 
             if 'route_lines_visible' in data:
                 self._route_lines_visible = bool(data['route_lines_visible'])
+
+            if 'route_alpha' in data:
+                self._route_alpha = max(0.0, min(1.0, int(data['route_alpha']) / 100.0))
+
+            if 'skip_update_version' in data:
+                sv = data.get('skip_update_version')
+                self._skip_update_version = sv if isinstance(sv, str) and sv else None
 
             if 'invert_dirs' in data:
                 self._invert_dirs = bool(data['invert_dirs'])
@@ -3179,6 +3551,203 @@ class SurveyApp:
 
         except Exception:
             pass
+
+    # ── update check / one-click update ───────────────────────────────────────
+    def _cleanup_stale_update_files(self):
+        """Remove any leftover GorgonSurveyTracker.exe.new from a previous failed update."""
+        if not _is_frozen_windows():
+            return
+        try:
+            stale = Path(sys.executable).parent / (_UPDATE_ASSET_NAME + '.new')
+            if stale.exists():
+                stale.unlink()
+        except Exception:
+            pass
+
+    def _on_update_button_click(self):
+        """The button is only visible when a new version is known — show the dialog."""
+        self._show_update_dialog()
+
+    def _check_for_updates(self):
+        self._update_checker.check()
+
+    def _on_update_check_result(self, result: dict):
+        self._latest_version      = result.get('latest')
+        self._latest_download_url = result.get('download_url')
+        self.control.refresh_update_button()
+        if not result.get('ok'):
+            err = result.get('error') or 'unknown error'
+            print(f'[update] check failed: {err}', file=sys.stderr)
+
+    def _show_update_dialog(self):
+        latest = self._latest_version
+        if not latest:
+            return
+        box = QMessageBox(self.control)
+        box.setWindowTitle('Update available')
+        box.setIcon(QMessageBox.Information)
+        action_label = 'Update' if _is_frozen_windows() and self._latest_download_url else 'Open Releases Page'
+        box.setText(
+            f'<b>Gorgon Survey Tracker v{latest}</b> is available.<br>'
+            f'You are running v{APP_VERSION}.'
+        )
+        btn_update = box.addButton(action_label, QMessageBox.AcceptRole)
+        btn_later  = box.addButton('Later',              QMessageBox.RejectRole)
+        btn_skip   = box.addButton('Skip this version',  QMessageBox.DestructiveRole)
+        box.setDefaultButton(btn_update)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is btn_update:
+            self._start_update_download()
+        elif clicked is btn_skip:
+            self._skip_update_version = latest
+            self.save_settings()
+            self.control.refresh_update_button()
+        # Later: no-op
+
+    def _start_update_download(self):
+        """Trigger the one-click update. Only replaces the exe on frozen Windows; else opens browser."""
+        if _is_frozen_windows() and self._latest_download_url:
+            self._do_windows_update()
+        else:
+            webbrowser.open(_UPDATE_PAGE_URL)
+
+    def _do_windows_update(self):
+        """Download the new .exe, write a self-deleting batch that swaps it in, and quit."""
+        url     = self._latest_download_url
+        old_exe = Path(sys.executable)
+        new_exe = old_exe.with_name(old_exe.name + '.new')
+
+        # Clean any stale .new file from a prior attempt.
+        try:
+            if new_exe.exists():
+                new_exe.unlink()
+        except Exception:
+            pass
+
+        # Download with a progress dialog on the main thread. Reads in chunks and
+        # pumps the Qt event loop so the UI stays responsive.
+        progress = QProgressDialog('Downloading update…', 'Cancel', 0, 0, self.control)
+        progress.setWindowTitle('Updating Gorgon Survey Tracker')
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        QApplication.processEvents()
+
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={'User-Agent': f'GorgonSurveyTracker/{APP_VERSION}'},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp, new_exe.open('wb') as out:
+                total = 0
+                try:
+                    total = int(resp.headers.get('Content-Length') or 0)
+                except Exception:
+                    total = 0
+                if total > 0:
+                    progress.setMaximum(total)
+                downloaded = 0
+                chunk = 64 * 1024
+                while True:
+                    if progress.wasCanceled():
+                        raise RuntimeError('cancelled')
+                    buf = resp.read(chunk)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    downloaded += len(buf)
+                    if total > 0:
+                        progress.setValue(downloaded)
+                    QApplication.processEvents()
+            # Verify the download completed. urllib won't raise if the TCP
+            # connection drops mid-stream — a short read silently becomes an
+            # empty chunk, so we check the byte count ourselves.
+            if total > 0 and downloaded != total:
+                raise RuntimeError(
+                    f'download truncated: got {downloaded:,} of {total:,} bytes'
+                )
+            # Sanity-check: a PyInstaller --onefile build is tens of MB. Anything
+            # under 1 MB is almost certainly a broken download or an error page.
+            actual_size = new_exe.stat().st_size
+            if actual_size < 1_000_000:
+                raise RuntimeError(
+                    f'downloaded file is too small ({actual_size:,} bytes) — likely corrupted'
+                )
+        except Exception as e:
+            progress.close()
+            try:
+                if new_exe.exists():
+                    new_exe.unlink()
+            except Exception:
+                pass
+            if str(e) != 'cancelled':
+                QMessageBox.warning(
+                    self.control, 'Update failed',
+                    f'Could not download the update:\n{type(e).__name__}: {e}',
+                )
+            return
+
+        progress.close()
+
+        # Write a self-deleting batch that waits for this process to release the exe,
+        # swaps the new one in, launches it, and deletes itself.
+        bat_path = Path(tempfile.gettempdir()) / f'gorgon_update_{os.getpid()}.bat'
+        bat = (
+            '@echo off\r\n'
+            'setlocal\r\n'
+            'set "OLD={old}"\r\n'
+            'set "NEW={new}"\r\n'
+            ':wait\r\n'
+            'del "%OLD%" >nul 2>&1\r\n'
+            'if exist "%OLD%" ( timeout /t 1 /nobreak >nul & goto wait )\r\n'
+            'move /y "%NEW%" "%OLD%" >nul\r\n'
+            'start "" "%OLD%"\r\n'
+            '(goto) 2>nul & del "%~f0"\r\n'
+        ).format(old=str(old_exe), new=str(new_exe))
+        try:
+            bat_path.write_text(bat, encoding='ascii')
+        except Exception as e:
+            QMessageBox.warning(
+                self.control, 'Update failed',
+                f'Could not stage the update script:\n{type(e).__name__}: {e}',
+            )
+            try:
+                new_exe.unlink()
+            except Exception:
+                pass
+            return
+
+        # Strip PyInstaller bootloader env vars before spawning the batch.
+        # When we're running as a --onefile exe, the bootloader sets vars like
+        # _MEIPASS2 and _PYI_APPLICATION_HOME_DIR pointing at OUR extraction dir.
+        # If those leak into the freshly-launched new exe, its bootloader gets
+        # confused (tries to load DLLs from the deleted old dir, or errors about
+        # the var being "not defined" when it's set to empty).
+        clean_env = {k: v for k, v in os.environ.items()
+                     if not (k.startswith('_MEI') or k.startswith('_PYI_'))}
+
+        try:
+            creationflags = 0
+            creationflags |= getattr(subprocess, 'DETACHED_PROCESS', 0x00000008)
+            creationflags |= getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
+            subprocess.Popen(
+                ['cmd', '/c', str(bat_path)],
+                creationflags=creationflags,
+                close_fds=True,
+                env=clean_env,
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self.control, 'Update failed',
+                f'Could not launch the update script:\n{type(e).__name__}: {e}',
+            )
+            return
+
+        self.save_settings()
+        QApplication.quit()
 
     # ── summary ───────────────────────────────────────────────────────────────
     def _track_summary_items(self, lines: list):
@@ -3280,16 +3849,14 @@ class SurveyApp:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def _apply_grid_config():
-    """Load GRID_COLS / SLOT_SIZE / SLOT_GAP / DUMMY_SLOTS from settings before overlays are created."""
-    global GRID_COLS, SLOT_SIZE, SLOT_GAP, DUMMY_SLOTS
+    """Load GRID_COLS from settings before overlays are created."""
+    global GRID_COLS
     try:
         if SETTINGS_PATH.exists():
             data = json.loads(SETTINGS_PATH.read_text())
             g = data.get('grid', {})
-            if 'cols'      in g: GRID_COLS = max(1,  int(g['cols']))
-            if 'slot_size' in g: SLOT_SIZE  = max(16, int(g['slot_size']))
-            if 'slot_gap'  in g: SLOT_GAP   = max(0,  int(g['slot_gap']))
-            if 'dummy_slots' in g: DUMMY_SLOTS = max(0,  int(g['dummy_slots']))
+            if 'cols' in g:
+                GRID_COLS = max(1, int(g['cols']))
     except Exception:
         pass
 
@@ -3359,25 +3926,6 @@ def main():
 
     _apply_grid_config()
     survey = SurveyApp()   # noqa — keeps windows alive
-
-    def OverlayToggleListener():
-        def on_activate():
-            survey.control.btn_overlays.click()
-
-        def for_canonical(f):
-            return lambda k: f(listener.canonical(k))
-
-        hotkey = _pynput_kb.HotKey(
-            _pynput_kb.HotKey.parse(survey.toggle_overlay_keybind),
-            on_activate)
-        listener = _pynput_kb.Listener(
-                on_press=for_canonical(hotkey.press),
-                on_release=for_canonical(hotkey.release))
-        listener.start()
-
-    keyboard_thread = threading.Thread(target=OverlayToggleListener())
-    keyboard_thread.run()
-
     app.aboutToQuit.connect(survey._stop_kb_listener)
     sys.exit(app.exec_())
 

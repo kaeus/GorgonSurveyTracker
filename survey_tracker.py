@@ -65,6 +65,7 @@ GRID_COLS   = 10
 GRID_ROWS   = 8
 SLOT_SIZE   = 50          # px
 SLOT_GAP    = 2           # px
+DUMMY_SLOTS = 0
 HEADER_H    = 28          # px — header height for both overlays
 
 # Qt.Key_* → human-readable label (platform-neutral; used by HotkeyCaptureDialog)
@@ -1127,6 +1128,7 @@ class InventoryOverlay(DragMixin, QWidget):
         self._rebuild_grid()
 
     def _rebuild_grid(self):
+        global GRID_COLS, SLOT_SIZE, SLOT_GAP, DUMMY_SLOTS
         # Clear old slots
         while self._grid_layout.count():
             w = self._grid_layout.takeAt(0).widget()
@@ -3278,7 +3280,7 @@ class SurveyApp:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def _apply_grid_config():
-    """Load GRID_COLS / SLOT_SIZE / SLOT_GAP from settings before overlays are created."""
+    """Load GRID_COLS / SLOT_SIZE / SLOT_GAP / DUMMY_SLOTS from settings before overlays are created."""
     global GRID_COLS, SLOT_SIZE, SLOT_GAP, DUMMY_SLOTS
     try:
         if SETTINGS_PATH.exists():

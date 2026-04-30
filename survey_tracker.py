@@ -1865,6 +1865,7 @@ class SurveyApp:
         self._inv_items             = {}     # item_name -> total count (primary + bonus)
         self._tracking_xp           = False  # True while routing session is live
         self._summary_data          = None   # dict; set when session completes
+        self.toggle_overlay_keybind = 'm'
 
         # Polling timer (0.5 s)
         self._timer = QTimer()
@@ -2788,7 +2789,7 @@ class SurveyApp:
 
     def _click_next_survey_slot(self):
         """Double-click the next empty inventory slot during the surveying phase."""
-        next_idx = len(self.state.uncollected())
+        next_idx = len(self.state.uncollected()) + DUMMY_SLOTS
         slots = self.inv_overlay._slots
         if next_idx < len(slots):
             slot = slots[next_idx]
@@ -3356,6 +3357,25 @@ def main():
 
     _apply_grid_config()
     survey = SurveyApp()   # noqa — keeps windows alive
+
+    def OverlayToggleListener():
+        def on_activate():
+            survey.control.btn_overlays.click()
+
+        def for_canonical(f):
+            return lambda k: f(listener.canonical(k))
+
+        hotkey = _pynput_kb.HotKey(
+            _pynput_kb.HotKey.parse(survey.toggle_overlay_keybind),
+            on_activate)
+        listener = _pynput_kb.Listener(
+                on_press=for_canonical(hotkey.press),
+                on_release=for_canonical(hotkey.release))
+        listener.start()
+
+    keyboard_thread = threading.Thread(target=OverlayToggleListener())
+    keyboard_thread.run()
+
     app.aboutToQuit.connect(survey._stop_kb_listener)
     sys.exit(app.exec_())
 

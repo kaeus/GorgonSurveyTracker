@@ -60,7 +60,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore  import Qt, QTimer, QPoint, QSize, pyqtSignal, QObject
 from PyQt5.QtGui   import (
-    QPainter, QColor, QPen, QBrush, QFont, QCursor,
+    QPainter, QColor, QPen, QBrush, QFont, QCursor,QMouseEvent
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,6 +403,24 @@ def _set_click_through(hwnd_int: int, enabled: bool):
             pass  # python-xlib not installed
         except Exception:
             pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hotkey Button overload
+# ─────────────────────────────────────────────────────────────────────────────
+class HotkeySignal(QObject):
+    right_clicked = pyqtSignal()
+
+class HotkeyButton(QPushButton):
+    def __init__(self, text):
+        super(HotkeyButton, self).__init__()
+        self.signal_emitter = HotkeySignal()
+
+    def mousePressEvent(self, QMouseEvent):
+        if QMouseEvent.button() == Qt.LeftButton:
+            self.clicked.emit()
+        elif QMouseEvent.button() == Qt.RightButton:
+            print('right clicked')
+            self.signal_emitter.right_clicked.emit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1630,6 +1648,17 @@ class ControlPanel(QWidget):
         )
         return b
 
+    def _hotkey_btn(self, text, callback, alt_callback, color='#1a1a2e'):
+        b = HotkeyButton(text)
+        b.clicked.connect(callback)
+        b.signal_emitter.right_clicked.connect(alt_callback)
+        b.setStyleSheet(
+            f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ background: #2a3a5a; }}'
+        )
+        return b
+
     def _label(self, text, color='#778'):
         lb = QLabel(text)
         lb.setStyleSheet(f'color:{color}; font-size:11px;')
@@ -1708,10 +1737,10 @@ class ControlPanel(QWidget):
         #     'Toggles visibility of the map and inventory overlays.'
         # )
         self.btn_overlays_map.setToolTip(
-            'Toggles visibility of the map overlay.'
+            'Toggles visibility of the map overlay. Right-click to remove the binding.'
         )
         self.btn_overlays_inv.setToolTip(
-            'Toggles visibility of the inventory overlay.'
+            'Toggles visibility of the inventory overlay. Right-click to remove the binding.'
         )
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
@@ -1723,8 +1752,8 @@ class ControlPanel(QWidget):
         self.btn_mode_regular = self._btn('Regular Survey',    self.app.exit_ml_mode,  '#1a3a6a')
         self.btn_mode_ml      = self._btn('Motherlode Survey', self.app.enter_ml_mode, '#4a1a4a')
         self.btn_hotkey       = self._small_btn('Hotkey: Num0', self.app.set_hotkey_binding, '#1a3a2a')
-        self.btn_mapkey       = self._small_btn('Map: M', self.app.set_mapkey_binding, '#1a3a2a')
-        self.btn_invkey       = self._small_btn('Inv: I', self.app.set_invkey_binding, '#1a3a2a')
+        self.btn_mapkey       = self._hotkey_btn('Map: M', self.app.set_mapkey_binding, self.app.remove_mapkey_binding, '#1a3a2a')
+        self.btn_invkey       = self._hotkey_btn('Inv: I', self.app.set_invkey_binding, self.app.remove_invkey_binding, '#1a3a2a')
         row_mode.addWidget(self.btn_mode_regular)
         row_mode.addWidget(self.btn_mode_ml)
         row_mode.addStretch()
@@ -3426,6 +3455,17 @@ class SurveyApp:
             #     self._start_kb_listener()
         self._capturing_hotkey = False
 
+    def remove_mapkey_binding(self):
+        self._mapkey_config = {
+            'qt_key':    0,
+            'qt_mods':   0,
+            'modifiers': [],
+            'label':     "--",
+        }
+        self.control.btn_mapkey.setText(f'Map: --')
+        self.save_settings()
+
+
     def set_invkey_binding(self):
         self._capturing_hotkey = True
         dlg = HotkeyCaptureDialog(self.control)
@@ -3441,6 +3481,16 @@ class SurveyApp:
             # if _HOTKEY_SUPPORTED:
             #     self._start_kb_listener()
         self._capturing_hotkey = False
+
+    def remove_invkey_binding(self):
+        self._invkey_config = {
+            'qt_key':    0,
+            'qt_mods':   0,
+            'modifiers': [],
+            'label':     "--",
+        }
+        self.control.btn_invkey.setText(f'Inv: --')
+        self.save_settings()
 
     def toggle_invert_dirs(self):
         self._invert_dirs = not self._invert_dirs
@@ -3646,7 +3696,7 @@ class SurveyApp:
                     if 'qt_key' in hk:
                         self._mapkey_config = hk
                     lbl = self._mapkey_config.get('label', 'M')
-                    self.control.btn_mapkey.setText(f'Hotkey: {lbl}')
+                    self.control.btn_mapkey.setText(f'Map: {lbl}')
 
             if 'invkey' in data:
                 hk = data['invkey']
@@ -3654,7 +3704,8 @@ class SurveyApp:
                     if 'qt_key' in hk:
                         self._invkey_config = hk
                     lbl = self._invkey_config.get('label', 'I')
-                    self.control.btn_invkey.setText(f'Hotkey: {lbl}')
+                    self.control.btn_invkey.setText(f'Inv: {lbl}')
+
             # Restart pynput listener with the loaded config
             if _HOTKEY_SUPPORTED:
                 self._start_kb_listener()

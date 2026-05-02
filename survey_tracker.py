@@ -56,10 +56,11 @@ from PyQt5.QtWidgets import (
     QGridLayout, QVBoxLayout, QHBoxLayout, QFrame, QGroupBox,
     QFileDialog, QMessageBox, QSizeGrip, QProgressDialog,
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
+    QSizePolicy
 )
 from PyQt5.QtCore  import Qt, QTimer, QPoint, QSize, pyqtSignal, QObject
 from PyQt5.QtGui   import (
-    QPainter, QColor, QPen, QBrush, QFont, QCursor,
+    QPainter, QColor, QPen, QBrush, QFont, QCursor, QMouseEvent
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,6 +403,24 @@ def _set_click_through(hwnd_int: int, enabled: bool):
             pass  # python-xlib not installed
         except Exception:
             pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hotkey Button overload
+# ─────────────────────────────────────────────────────────────────────────────
+class HotkeySignal(QObject):
+    right_clicked = pyqtSignal()
+
+class HotkeyButton(QPushButton):
+    def __init__(self, text):
+        super(HotkeyButton, self).__init__()
+        self.signal_emitter = HotkeySignal()
+        self.setText(text)
+
+    def mousePressEvent(self, QMouseEvent):
+        if QMouseEvent.button() == Qt.LeftButton:
+            self.clicked.emit()
+        elif QMouseEvent.button() == Qt.RightButton:
+            self.signal_emitter.right_clicked.emit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1025,6 +1044,8 @@ class MapOverlay(DragMixin, QWidget):
         # raise_() which steals focus from the game on X11. The lock button
         # is re-synced only on real events (show/move/resize) below.
         self.update()
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1174,6 +1195,22 @@ class SlotWidget(QFrame):
             self.clicked.emit(self.item)
 
 
+class DummySlot(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # background
+        p.fillRect(0, 0, w, h, QColor(0, 0, 0, 200))
+        p.setPen(QPen(QColor(100, 170, 255, 150), 1))
+        p.drawRoundedRect(0, 0, w - 1, h - 1, 2, 2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Inventory Overlay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1244,19 +1281,26 @@ class InventoryOverlay(DragMixin, QWidget):
         sc    = self.state.survey_count
         total = max(sc, len(uncollected)) if sc > 0 else len(uncollected)
         if total == 0:
-            total = GRID_COLS   # show a placeholder row before any items are found
+            total = GRID_COLS - self.app._offset_slots  # show a placeholder row before any items are found
 
         # Compute slot width so 10 columns fill the full overlay width evenly
         slot_w = max(28, (self.width() - 12 - SLOT_GAP * (GRID_COLS - 1)) // GRID_COLS)
 
+        for d in range(self.app._offset_slots):
+            slot = DummySlot(self._grid_container)
+            slot.setFixedSize(slot_w, slot_w)
+            row, col = divmod(d, GRID_COLS)
+            self._grid_layout.addWidget(slot, row, col)
+            self._slots.append(slot)
+
         for i in range(total):
             item = uncollected[i] if i < len(uncollected) else None
             slot = SlotWidget(item, self._grid_container)
-            slot.setFixedSize(slot_w, slot_w)
             if item and item['id'] == active_id:
                 slot.setProperty('active_route', True)
             slot.clicked.connect(self.app.on_inventory_click)
-            row, col = divmod(i, GRID_COLS)
+            slot.setFixedSize(slot_w, slot_w)
+            row, col = divmod(i + self.app._offset_slots, GRID_COLS)
             self._grid_layout.addWidget(slot, row, col)
             self._slots.append(slot)
 
@@ -1358,6 +1402,8 @@ class InventoryOverlay(DragMixin, QWidget):
         # real events only (show/move/resize).
         self._rebuild_grid()
         self.update()
+        if hasattr(self, 'lock_btn'):
+            self.lock_btn.sync()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1506,7 +1552,7 @@ class SummaryWindow(QDialog):
 class HotkeyCaptureDialog(QDialog):
     """Modal dialog that captures a single keypress (+ modifiers) as a hotkey."""
 
-    def __init__(self, parent=None):
+    def __init__(self, text, parent=None):
         super().__init__(parent)
         self.result_qt_key  = None   # int — Qt.Key_* value
         self.result_qt_mods = 0      # int — Qt.KeyboardModifiers flags
@@ -1514,11 +1560,7 @@ class HotkeyCaptureDialog(QDialog):
         self.result_label   = ''
         self.setWindowTitle('Set Hotkey')
         self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
-        lbl = QLabel(
-            'Press the desired key combination (Esc = cancel)\n\n'
-            'During Surveying: clicks the next empty inventory slot\n'
-            'During Routing: double-clicks the active slot to collect it'
-        )
+        lbl = QLabel(text)
         lbl.setAlignment(Qt.AlignCenter)
         lbl.setStyleSheet('color:#cde; font-size:11px; padding:12px;')
         layout = QVBoxLayout(self)
@@ -1602,6 +1644,18 @@ class ControlPanel(QWidget):
         )
         return b
 
+    def _hotkey_btn(self, text, callback, alt_callback, color='#1a1a2e'):
+        b = HotkeyButton(text)
+        b.clicked.connect(callback)
+        b.signal_emitter.right_clicked.connect(alt_callback)
+        b.setStyleSheet(
+            f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ background: #2a3a5a; }}'
+        )
+        b.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        return b
+
     def _label(self, text, color='#778'):
         lb = QLabel(text)
         lb.setStyleSheet(f'color:{color}; font-size:11px;')
@@ -1664,9 +1718,10 @@ class ControlPanel(QWidget):
         main.addLayout(row_title)
 
         # (Toggles — Labels / Route / Overlays are constructed later in the Toggles group)
-        self.btn_labels      = self._small_btn('Labels: Name', self.app.toggle_map_labels, '#1a2a3a')
-        self.btn_route_lines = self._small_btn('Route: ON',    self.app.toggle_route_lines, '#1a2a3a')
-        self.btn_overlays    = self._small_btn('Overlays: ON', self.app.toggle_overlays,    '#1a3a1a')
+        self.btn_labels       = self._small_btn('Labels: Name', self.app.toggle_map_labels, '#1a2a3a')
+        self.btn_route_lines  = self._small_btn('Route: ON',    self.app.toggle_route_lines, '#1a2a3a')
+        self.btn_overlays_map = self._small_btn('Map: ON', self.app.toggle_map_overlay,    '#1a3a1a')
+        self.btn_overlays_inv = self._small_btn('Inv: ON', self.app.toggle_inv_overlay,    '#1a3a1a')
         self.btn_labels.setToolTip(
             'Cycles between display options for labelling the points on the '
             'map as you survey.'
@@ -1674,8 +1729,11 @@ class ControlPanel(QWidget):
         self.btn_route_lines.setToolTip(
             'Toggles the route lines that guide you once a path has been set.'
         )
-        self.btn_overlays.setToolTip(
-            'Toggles visibility of the map and inventory overlays.'
+        self.btn_overlays_map.setToolTip(
+            'Toggles visibility of the map overlay. Right-click to remove the binding.'
+        )
+        self.btn_overlays_inv.setToolTip(
+            'Toggles visibility of the inventory overlay. Right-click to remove the binding.'
         )
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
@@ -1686,11 +1744,24 @@ class ControlPanel(QWidget):
         row_mode = QHBoxLayout()
         self.btn_mode_regular = self._btn('Regular Survey',    self.app.exit_ml_mode,  '#1a3a6a')
         self.btn_mode_ml      = self._btn('Motherlode Survey', self.app.enter_ml_mode, '#4a1a4a')
-        self.btn_hotkey       = self._small_btn('Hotkey: Num0', self.app.set_hotkey_binding, '#1a3a2a')
+        self.btn_hotkey       = self._hotkey_btn('Survey: Num0', self.app.set_hotkey_binding, self.app.remove_hotkey_binding, '#1a3a2a')
+        self.btn_mapkey       = self._hotkey_btn('Map: M', self.app.set_mapkey_binding, self.app.remove_mapkey_binding, '#1a3a2a')
+        self.btn_invkey       = self._hotkey_btn('Inv: I', self.app.set_invkey_binding, self.app.remove_invkey_binding, '#1a3a2a')
+        _hotkey_tip = 'Click to set a new binding. Right-click to clear.'
+        self.btn_hotkey.setToolTip(_hotkey_tip)
+        self.btn_mapkey.setToolTip(_hotkey_tip)
+        self.btn_invkey.setToolTip(_hotkey_tip)
         row_mode.addWidget(self.btn_mode_regular)
         row_mode.addWidget(self.btn_mode_ml)
         row_mode.addStretch()
-        row_mode.addWidget(self.btn_hotkey)
+        hotkey_buttons = QVBoxLayout()
+        hotkey_buttons.setContentsMargins(5,0,5,0)
+        hotkey_buttons.setSpacing(2)
+        hotkey_buttons.addWidget(self.btn_hotkey)
+        if _HOTKEY_SUPPORTED:
+            hotkey_buttons.addWidget(self.btn_mapkey)
+            hotkey_buttons.addWidget(self.btn_invkey)
+        row_mode.addLayout(hotkey_buttons)
         main.addLayout(row_mode)
 
         # ── Files row ──────────────────────────────────────────────────────
@@ -1727,7 +1798,11 @@ class ControlPanel(QWidget):
 
         # ── Survey controls (regular mode) ───────────────────────────────
         self._regular_controls = QWidget()
-        rc_layout = QHBoxLayout(self._regular_controls)
+        self._regular_controls.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        vert_layout = QVBoxLayout(self._regular_controls)
+        vert_layout.setContentsMargins(0, 0, 0, 0)
+        vert_layout.setSpacing(3)
+        rc_layout = QHBoxLayout()
         rc_layout.setContentsMargins(0, 0, 0, 0)
         rc_layout.addWidget(self._label('Surveys:'))
         self.sb_count = QSpinBox()
@@ -1753,6 +1828,26 @@ class ControlPanel(QWidget):
         for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next, self.btn_mark, self.btn_reset, self.btn_summary):
             rc_layout.addWidget(b)
         rc_layout.addStretch()
+        vert_layout.addLayout(rc_layout)
+        # ── Add selector for empty offset control ───────────
+        oc_layout = QHBoxLayout()
+        oc_layout.setContentsMargins(0, 0, 0, 0)
+        oc_layout.addWidget(self._label('1st Row Offset:'))
+        self.offset_count = QSpinBox()
+        self.offset_count.setRange(0, GRID_COLS - 1)
+        self.offset_count.setValue(0)
+        self.offset_count.setSpecialValueText('0')
+        self.offset_count.setToolTip('How many inventory slots to offset in the first row?')
+        self.offset_count.setMaximumWidth(60)
+        self.offset_count.setStyleSheet(
+            'QSpinBox { background:#1a1a2e; color:#cde; border:1px solid #446; '
+            'padding:2px 4px; border-radius:4px; font-size:12px; }'
+            'QSpinBox::up-button, QSpinBox::down-button { width:14px; }'
+        )
+        self.offset_count.valueChanged.connect(self.app.on_offset_count_changed)
+        oc_layout.addWidget(self.offset_count)
+        oc_layout.addStretch()
+        vert_layout.addLayout(oc_layout)
         sec.addWidget(self._regular_controls)
 
         # ── Motherlode controls (shown only in motherlode mode) ───────────
@@ -1868,7 +1963,11 @@ class ControlPanel(QWidget):
 
         toggles_col2.addWidget(self.btn_labels)
         toggles_col2.addWidget(self.btn_route_lines)
-        toggles_col2.addWidget(self.btn_overlays)
+        overlays_toggles = QHBoxLayout()
+        overlays_toggles.setContentsMargins(0,0,0,0)
+        overlays_toggles.addWidget(self.btn_overlays_map)
+        overlays_toggles.addWidget(self.btn_overlays_inv)
+        toggles_col2.addLayout(overlays_toggles)
 
         toggles_row.addLayout(toggles_col1)
         toggles_row.addLayout(toggles_col2)
@@ -2025,11 +2124,21 @@ class ControlPanel(QWidget):
             f'QPushButton:hover {{ border-color: #8ab; }}'
         )
 
-        vis = getattr(self.app, '_overlays_visible', True)
+        vis = getattr(self.app, '_map_visible', True)
         label = 'ON' if vis else 'OFF'
         color = '#1a3a1a' if vis else '#5a1a1a'
-        self.btn_overlays.setText(f'Overlays: {label}')
-        self.btn_overlays.setStyleSheet(
+        self.btn_overlays_map.setText(f'Map: {label}')
+        self.btn_overlays_map.setStyleSheet(
+            f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ border-color: #8ab; }}'
+        )
+
+        vis = getattr(self.app, '_inv_visible', True)
+        label = 'ON' if vis else 'OFF'
+        color = '#1a3a1a' if vis else '#5a1a1a'
+        self.btn_overlays_inv.setText(f'Inv: {label}')
+        self.btn_overlays_inv.setStyleSheet(
             f'QPushButton {{ background:{color}; color:#cde; border:1px solid #446; '
             f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
             f'QPushButton:hover {{ border-color: #8ab; }}'
@@ -2099,6 +2208,7 @@ class SurveyApp:
         self._latest_version       = None
         self._latest_download_url  = None
         self._skip_update_version  = None
+        self._offset_slots = 0
 
         self.map_overlay  = MapOverlay(self.state, self)
         self.inv_overlay  = InventoryOverlay(self.state, self)
@@ -2113,7 +2223,9 @@ class SurveyApp:
         self._ml_collect_last  = 0.0  # time.monotonic() of last motherlode collection
         self._click_through    = False
         self._inv_locked       = False
-        self._overlays_visible    = True
+        # self._overlays_visible = True
+        self._inv_visible      = True
+        self._map_visible      = True
         self._route_lines_visible = True
         self._route_alpha         = 0.82   # 0.0–1.0; applied to route-line pen
         self._invert_dirs      = False
@@ -2138,6 +2250,7 @@ class SurveyApp:
 
         # Configurable survey-slot hotkey (default: Numpad 0)
         # Config stores Qt.Key_* int + Qt.KeyboardModifiers int (platform-neutral).
+        self._capturing_hotkey = False
         self._hotkey_config = {
             'qt_key':    int(Qt.Key_0),
             'qt_mods':   int(Qt.KeypadModifier),
@@ -2145,13 +2258,30 @@ class SurveyApp:
             'label':     'Num0',
         }
         self._hotkey_down      = False
-        self._capturing_hotkey = False
         self._held_modifiers   = set()   # modifier keys currently held (written by pynput thread)
+        self._invkey_config = {
+            'qt_key':    int(Qt.Key_I),
+            'qt_mods':   int(Qt.KeypadModifier),
+            'modifiers': [],
+            'label':     'I',
+        }
+        self._invhotkey_down   = False
+        self._mapkey_config = {
+            'qt_key':    int(Qt.Key_M),
+            'qt_mods':   int(Qt.KeypadModifier),
+            'modifiers': [],
+            'label':     'M',
+        }
+        self._maphotkey_down   = False
         self._kb_listener      = None
 
         if _HOTKEY_SUPPORTED:
             self._hk_bridge = _HotkeySignalBridge()
             self._hk_bridge.triggered.connect(self._trigger_survey_slot)
+            self._maphk_bridge = _HotkeySignalBridge()
+            self._maphk_bridge.triggered.connect(self.toggle_map_overlay)
+            self._invhk_bridge = _HotkeySignalBridge()
+            self._invhk_bridge.triggered.connect(self.toggle_inv_overlay)
             self._start_kb_listener()
         elif sys.platform == 'win32':
             # Legacy fallback when pynput is not installed
@@ -2172,11 +2302,13 @@ class SurveyApp:
         self._update_timer.timeout.connect(self._check_for_updates)
         self._update_timer.start(5 * 60 * 1000)
 
-        if self._overlays_visible:
+        if self._map_visible:
             self.map_overlay.show()
-            self.inv_overlay.show()
             _macos_raise_overlay(self.map_overlay)
+        if self._inv_visible:
+            self.inv_overlay.show()
             _macos_raise_overlay(self.inv_overlay)
+
         self.control.show()
 
     # ── file selection ────────────────────────────────────────────────────────
@@ -2868,11 +3000,20 @@ class SurveyApp:
                 self._held_modifiers.add('shift')
             elif key in (_pynput_kb.Key.alt, _pynput_kb.Key.alt_l, _pynput_kb.Key.alt_r):
                 self._held_modifiers.add('alt')
-            if self._capturing_hotkey or self._hotkey_down:
+
+            if self._capturing_hotkey or self._hotkey_down or self._maphotkey_down or self._invhotkey_down:
                 return
-            if self._pynput_key_matches(key):
+
+            if self._pynput_matches(key, self._hotkey_config):
                 self._hotkey_down = True
                 self._hk_bridge.triggered.emit()
+            if self._pynput_matches(key, self._mapkey_config):
+                self._maphotkey_down = True
+                self._maphk_bridge.triggered.emit()
+            if self._pynput_matches(key, self._invkey_config):
+                self._invhotkey_down = True
+                self._invhk_bridge.triggered.emit()
+
 
         def on_release(key):
             if key in (_pynput_kb.Key.ctrl, _pynput_kb.Key.ctrl_l, _pynput_kb.Key.ctrl_r):
@@ -2881,8 +3022,13 @@ class SurveyApp:
                 self._held_modifiers.discard('shift')
             elif key in (_pynput_kb.Key.alt, _pynput_kb.Key.alt_l, _pynput_kb.Key.alt_r):
                 self._held_modifiers.discard('alt')
-            if self._pynput_key_matches(key):
+
+            if self._pynput_matches(key, self._hotkey_config):
                 self._hotkey_down = False
+            if self._pynput_matches(key, self._invkey_config):
+                self._invhotkey_down = False
+            if self._pynput_matches(key, self._mapkey_config):
+                self._maphotkey_down = False
 
         try:
             listener = _pynput_kb.Listener(on_press=on_press, on_release=on_release)
@@ -2904,7 +3050,7 @@ class SurveyApp:
                 pass
             self._kb_listener = None
 
-    # Windows VK codes for numpad digits (used in _pynput_key_matches)
+    # Windows VK codes for numpad digits (used in _pynput_matches)
     _WIN32_NUMPAD_VK = {
         int(Qt.Key_0): 0x60, int(Qt.Key_1): 0x61, int(Qt.Key_2): 0x62,
         int(Qt.Key_3): 0x63, int(Qt.Key_4): 0x64, int(Qt.Key_5): 0x65,
@@ -2944,25 +3090,21 @@ class SurveyApp:
             }
         return SurveyApp._QT_TO_PYNPUT_SPECIAL or {}
 
-    def _pynput_key_matches(self, key) -> bool:
-        """Return True if the pynput key event matches the configured hotkey."""
-        hk      = self._hotkey_config
-        qt_key  = hk.get('qt_key',  int(Qt.Key_0))
-        qt_mods = hk.get('qt_mods', int(Qt.KeypadModifier))
+    def _pynput_matches(self, key, hk: dict) -> bool:
+        """Return True if the pynput key event matches the given hotkey config."""
+        qt_key  = hk.get('qt_key',  0)
+        qt_mods = hk.get('qt_mods', int(Qt.NoModifier))
         mods    = hk.get('modifiers', [])
         is_numpad = bool(qt_mods & int(Qt.KeypadModifier))
 
-        # Modifier check
         for m in mods:
             if m not in self._held_modifiers:
                 return False
 
-        # Special keys (F1-F12, arrows, etc.)
         special = self._get_qt_to_pynput_special()
         if qt_key in special:
             return key == special[qt_key]
 
-        # Numpad digits — platform-specific VK comparison
         if is_numpad and int(Qt.Key_0) <= qt_key <= int(Qt.Key_9):
             if sys.platform == 'win32':
                 expected_vk = self._WIN32_NUMPAD_VK.get(qt_key)
@@ -2970,16 +3112,15 @@ class SurveyApp:
             elif sys.platform == 'darwin':
                 expected_vk = self._DARWIN_NUMPAD_VK.get(qt_key)
                 return expected_vk is not None and getattr(key, 'vk', None) == expected_vk
-            # Linux: numpad digits (NumLock on) arrive as char '0'-'9'
             return getattr(key, 'char', None) == chr(qt_key)
 
-        # Regular letters / digits — compare char
         if int(Qt.Key_A) <= qt_key <= int(Qt.Key_Z):
             return getattr(key, 'char', None) == chr(qt_key).lower()
         if int(Qt.Key_0) <= qt_key <= int(Qt.Key_9):
             return getattr(key, 'char', None) == chr(qt_key)
 
         return False
+
 
     # Legacy Windows-only polling (used when pynput is not installed)
     def _poll_hotkeys(self):
@@ -3048,7 +3189,7 @@ class SurveyApp:
         item = next((i for i in state.items if i['id'] == active_id), None)
         if item is None:
             return
-        grid_idx = item['grid_index']
+        grid_idx = item['grid_index'] + self._offset_slots
         slots = self.inv_overlay._slots
         if grid_idx < len(slots):
             slot = slots[grid_idx]
@@ -3063,7 +3204,7 @@ class SurveyApp:
 
     def _click_next_survey_slot(self):
         """Double-click the next empty inventory slot during the surveying phase."""
-        next_idx = len(self.state.uncollected())
+        next_idx = len(self.state.uncollected()) + self._offset_slots
         slots = self.inv_overlay._slots
         if next_idx < len(slots):
             slot = slots[next_idx]
@@ -3097,20 +3238,28 @@ class SurveyApp:
         self.control.refresh()
         self.save_settings()
 
-    def toggle_overlays(self):
-        self._overlays_visible = not self._overlays_visible
-        if self._overlays_visible:
+    def toggle_map_overlay(self):
+        self._map_visible = not self._map_visible
+        if self._map_visible:
             self.map_overlay.show()
-            self.inv_overlay.show()
             self.map_overlay.set_click_through(self._click_through)
-            _set_click_through(int(self.inv_overlay.winId()), self._inv_locked)
             _macos_raise_overlay(self.map_overlay)
-            _macos_raise_overlay(self.inv_overlay)
         else:
             self.map_overlay.hide()
+        self.control.refresh()
+        self.save_settings()
+
+    def toggle_inv_overlay(self):
+        self._inv_visible = not self._inv_visible
+        if self._inv_visible:
+            self.inv_overlay.show()
+            _set_click_through(int(self.inv_overlay.winId()), self._inv_locked)
+            _macos_raise_overlay(self.inv_overlay)
+        else:
             self.inv_overlay.hide()
         self.control.refresh()
         self.save_settings()
+
 
     # ── opacity / click-through ───────────────────────────────────────────────
     def set_overlay_opacity(self, which: str, value: int):
@@ -3130,6 +3279,11 @@ class SurveyApp:
 
     def on_survey_count_changed(self, value: int):
         self.state.survey_count = value
+        self.inv_overlay.refresh()
+        self.save_settings()
+
+    def on_offset_count_changed(self, value: int):
+        self._offset_slots = value
         self.inv_overlay.refresh()
         self.save_settings()
 
@@ -3175,7 +3329,8 @@ class SurveyApp:
 
     def set_hotkey_binding(self):
         self._capturing_hotkey = True
-        dlg = HotkeyCaptureDialog(self.control)
+        lbl = "Press the desired key combination (Esc = cancel)\n\nDuring Surveying: clicks the next empty Inventory slot\nDuring Routing: double-clicks the active slot to collect it"
+        dlg = HotkeyCaptureDialog(lbl, self.control)
         if dlg.exec_() == QDialog.Accepted and dlg.result_qt_key is not None:
             self._hotkey_config = {
                 'qt_key':    dlg.result_qt_key,
@@ -3183,11 +3338,88 @@ class SurveyApp:
                 'modifiers': dlg.result_mods,
                 'label':     dlg.result_label,
             }
-            self.control.btn_hotkey.setText(f'Hotkey: {dlg.result_label}')
+            self.control.btn_hotkey.setText(f'Survey: {dlg.result_label}')
             self.save_settings()
-            if _HOTKEY_SUPPORTED:
-                self._start_kb_listener()
+            # if _HOTKEY_SUPPORTED:
+            #     self._start_kb_listener()
         self._capturing_hotkey = False
+        self.control.adjustSize()
+        self.control.adjustSize()
+
+    def remove_hotkey_binding(self):
+        self._hotkey_config = {
+            'qt_key':    0,
+            'qt_mods':   0,
+            'modifiers': [],
+            'label':     "--",
+        }
+        self.control.btn_hotkey.setText(f'Survey: --')
+        self.save_settings()
+        self.control.adjustSize()
+        self.control.adjustSize()
+
+    def set_mapkey_binding(self):
+        self._capturing_hotkey = True
+        lbl = "Press the desired key combination (Esc = cancel)\n\nUse: Click to toggle the Map overlay.\nYou can assign the same key as the Inventory toggle."
+        dlg = HotkeyCaptureDialog(lbl, self.control)
+        if dlg.exec_() == QDialog.Accepted and dlg.result_qt_key is not None:
+            self._mapkey_config = {
+                'qt_key':    dlg.result_qt_key,
+                'qt_mods':   dlg.result_qt_mods,
+                'modifiers': dlg.result_mods,
+                'label':     dlg.result_label,
+            }
+            self.control.btn_mapkey.setText(f'Map: {dlg.result_label}')
+            self.save_settings()
+            # if _HOTKEY_SUPPORTED:
+            #     self._start_kb_listener()
+        self._capturing_hotkey = False
+        self.control.adjustSize()
+        self.control.adjustSize()
+
+    def remove_mapkey_binding(self):
+        self._mapkey_config = {
+            'qt_key':    0,
+            'qt_mods':   0,
+            'modifiers': [],
+            'label':     "--",
+        }
+        self.control.btn_mapkey.setText(f'Map: --')
+        self.save_settings()
+        self.control.adjustSize()
+        self.control.adjustSize()
+
+
+    def set_invkey_binding(self):
+        self._capturing_hotkey = True
+        lbl = " Press the desired key combination (Esc = cancel)\n\nUse: Click to toggle the inventory overlay.\nYou can assign the same key as the Map toggle."
+        dlg = HotkeyCaptureDialog(lbl, self.control)
+        if dlg.exec_() == QDialog.Accepted and dlg.result_qt_key is not None:
+            self._invkey_config = {
+                'qt_key':    dlg.result_qt_key,
+                'qt_mods':   dlg.result_qt_mods,
+                'modifiers': dlg.result_mods,
+                'label':     dlg.result_label,
+            }
+            self.control.btn_invkey.setText(f'Inv: {dlg.result_label}')
+            self.save_settings()
+            # if _HOTKEY_SUPPORTED:
+            #     self._start_kb_listener()
+        self._capturing_hotkey = False
+        self.control.adjustSize()
+        self.control.adjustSize()
+
+    def remove_invkey_binding(self):
+        self._invkey_config = {
+            'qt_key':    0,
+            'qt_mods':   0,
+            'modifiers': [],
+            'label':     "--",
+        }
+        self.control.btn_invkey.setText(f'Inv: --')
+        self.save_settings()
+        self.control.adjustSize()
+        self.control.adjustSize()
 
     def toggle_invert_dirs(self):
         self._invert_dirs = not self._invert_dirs
@@ -3262,11 +3494,15 @@ class SurveyApp:
                 'control': {'x': cp.x(), 'y': cp.y()},
                 'chat_dir':     self._chat_dir,
                 'survey_count': self.state.survey_count,
+                'offset_slots': self._offset_slots,
                 'map_labels':   self.map_overlay._show_labels,
                 'hotkey':       self._hotkey_config,
+                'mapkey':       self._mapkey_config,
+                'invkey':       self._invkey_config,
                 'inv_locked':   self._inv_locked,
                 'map_click_through': self._click_through,
-                'overlays_visible':     self._overlays_visible,
+                'map_visible':          self._map_visible,
+                'inv_visible':          self._inv_visible,
                 'route_lines_visible':  self._route_lines_visible,
                 'route_alpha':          int(self._route_alpha * 100),
                 'invert_dirs':          self._invert_dirs,
@@ -3364,6 +3600,13 @@ class SurveyApp:
                 self.control.sb_count.setValue(sc)
                 self.control.sb_count.blockSignals(False)
 
+            if 'offset_slots' in data:
+                os_val = max(0, min(GRID_COLS - 1, int(data['offset_slots'])))
+                self._offset_slots = os_val
+                self.control.offset_count.blockSignals(True)
+                self.control.offset_count.setValue(os_val)
+                self.control.offset_count.blockSignals(False)
+
             if 'map_labels' in data:
                 raw = data['map_labels']
                 # Backward compat: old bool → 1 (Name) or 0 (Off)
@@ -3381,7 +3624,24 @@ class SurveyApp:
                         self._hotkey_config = _migrate_vk_config(hk)
                     # else: non-Windows with old vk format → keep default
                     lbl = self._hotkey_config.get('label', 'Num0')
-                    self.control.btn_hotkey.setText(f'Hotkey: {lbl}')
+                    self.control.btn_hotkey.setText(f'Survey: {lbl}')
+
+            if 'mapkey' in data:
+                hk = data['mapkey']
+                if isinstance(hk, dict):
+                    if 'qt_key' in hk:
+                        self._mapkey_config = hk
+                    lbl = self._mapkey_config.get('label', 'M')
+                    self.control.btn_mapkey.setText(f'Map: {lbl}')
+
+            if 'invkey' in data:
+                hk = data['invkey']
+                if isinstance(hk, dict):
+                    if 'qt_key' in hk:
+                        self._invkey_config = hk
+                    lbl = self._invkey_config.get('label', 'I')
+                    self.control.btn_invkey.setText(f'Inv: {lbl}')
+
             # Restart pynput listener with the loaded config
             if _HOTKEY_SUPPORTED:
                 self._start_kb_listener()
@@ -3430,10 +3690,14 @@ class SurveyApp:
             if 'invert_dirs' in data:
                 self._invert_dirs = bool(data['invert_dirs'])
 
-            if 'overlays_visible' in data:
-                self._overlays_visible = bool(data['overlays_visible'])
-                if not self._overlays_visible:
+            if 'map_visible' in data:
+                self._map_visible = bool(data['map_visible'])
+                if not self._map_visible:
                     self.map_overlay.hide()
+
+            if 'inv_visible' in data:
+                self._inv_visible = bool(data['inv_visible'])
+                if not self._inv_visible:
                     self.inv_overlay.hide()
 
             ss = data.get('survey_state')

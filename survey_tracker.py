@@ -435,6 +435,7 @@ class SurveyState:
         self.pending_calib = None
         self.route_order   = []       # item ids in optimised order
         self.route_idx     = -1
+        self.route_start_pos = None   # (x, y) snapshot of player_pos at routing start (for "return to start")
         self._next_id      = 0
         self.survey_count  = 0        # 0 = show only found items; >0 = user-set total
 
@@ -499,7 +500,7 @@ class SurveyState:
         return (max(6.0, min(canvas_w - 6.0, px)),
                 max(6.0, min(canvas_h - 6.0, py)))
 
-    def optimise_route(self):
+    def optimise_route(self, return_to_start: bool = False):
         candidates = [i for i in self.items if not i['collected'] and i['pixel_pos']]
         if not candidates:
             return
@@ -512,20 +513,29 @@ class SurveyState:
             route.append(nearest['id'])
             current = nearest['pixel_pos']
             remaining.remove(nearest)
-        self.route_order = self._two_opt(route)
+        self.route_order = self._two_opt(route, return_to_start=return_to_start)
         for idx, iid in enumerate(self.route_order):
             item = next((i for i in self.items if i['id'] == iid), None)
             if item:
                 item['route_order'] = idx
 
-    def _two_opt(self, route: list) -> list:
-        """Improve a route with 2-opt edge swaps until no swap reduces total distance."""
+    def _two_opt(self, route: list, return_to_start: bool = False) -> list:
+        """Improve a route with 2-opt edge swaps until no swap reduces total distance.
+
+        When return_to_start is True, the route is treated as a closed loop
+        (start → r1 → ... → rn → start), so the closing edge participates in the
+        optimisation and survey points nearest the start end up scheduled last.
+        """
         if len(route) < 4:
             return route
         pos   = {i['id']: i['pixel_pos'] for i in self.items}
         start = self.player_pos or (0.0, 0.0)
-        pts   = [start] + [pos[iid] for iid in route]
-        ids   = [None]  + list(route)
+        if return_to_start:
+            pts = [start] + [pos[iid] for iid in route] + [start]
+            ids = [None]  + list(route)                 + [None]
+        else:
+            pts = [start] + [pos[iid] for iid in route]
+            ids = [None]  + list(route)
         n     = len(pts)
         improved = True
         while improved:
@@ -538,7 +548,17 @@ class SurveyState:
                         pts[i+1:j+1] = pts[i+1:j+1][::-1]
                         ids[i+1:j+1] = ids[i+1:j+1][::-1]
                         improved = True
-        return ids[1:]
+        # Strip the leading start sentinel; the trailing one (if present) is None too.
+        result = [iid for iid in ids[1:] if iid is not None]
+        # For closed-loop tours, 2-opt yields an undirected optimal cycle. Choose
+        # the traversal direction so the LAST stop is the one closest to start —
+        # i.e. you finish near the vendor and the walk back is short.
+        if return_to_start and len(result) >= 2:
+            first_pos = pos.get(result[0])
+            last_pos  = pos.get(result[-1])
+            if first_pos and last_pos and pt_dist(start, first_pos) < pt_dist(start, last_pos):
+                result.reverse()
+        return result
 
     @property
     def active_id(self):
@@ -801,9 +821,13 @@ class MapOverlay(DragMixin, QWidget):
         # ── route lines ──
         if (self.app._route_lines_visible
                 and self.state.phase == 'routing' and len(self.state.route_order) >= 1):
-            pen = QPen(QColor(255, 210, 50, int(self.app._route_alpha * 255)), 2.5, Qt.DashLine)
+            alpha = int(self.app._route_alpha * 255)
+            pen = QPen(QColor(255, 210, 50, alpha), 2.5, Qt.DashLine)
             pen.setDashPattern([6, 3])
-            p.setPen(pen)
+            # The current leg (player → active survey dot) gets a brighter cyan
+            # pen so it's obvious where you're heading next.
+            current_pen = QPen(QColor(60, 220, 255, alpha), 3.0, Qt.DashLine)
+            current_pen.setDashPattern([6, 3])
             pts = []
             if self.state.player_pos:
                 pts.append(self.state.player_pos)
@@ -811,7 +835,12 @@ class MapOverlay(DragMixin, QWidget):
                 item = next((i for i in self.state.items if i['id'] == iid), None)
                 if item and item['pixel_pos'] and not item['collected']:
                     pts.append(item['pixel_pos'])
+            if (self.app._return_to_start
+                    and self.state.route_start_pos
+                    and len(pts) >= 2):
+                pts.append(self.state.route_start_pos)
             for i in range(len(pts) - 1):
+                p.setPen(current_pen if i == 0 and self.state.player_pos else pen)
                 x1, y1 = pts[i];     x2, y2 = pts[i + 1]
                 p.drawLine(int(x1), int(y1 + cy), int(x2), int(y2 + cy))
 
@@ -1963,6 +1992,17 @@ class ControlPanel(QWidget):
 
         toggles_col2.addWidget(self.btn_labels)
         toggles_col2.addWidget(self.btn_route_lines)
+
+        self.btn_return_to_start = self._small_btn('Return to Start: OFF',
+                                                    self.app.toggle_return_to_start, '#3a1a3a')
+        self.btn_return_to_start.setToolTip(
+            'Close the route loop back to your starting position.\n'
+            'Useful when you start at a spot and want to end the\n'
+            'run back there — surveys nearest your start will be scheduled last and\n'
+            'a dashed line is drawn from the final survey back to where you began.'
+        )
+        toggles_col2.addWidget(self.btn_return_to_start)
+
         overlays_toggles = QHBoxLayout()
         overlays_toggles.setContentsMargins(0,0,0,0)
         overlays_toggles.addWidget(self.btn_overlays_map)
@@ -2115,6 +2155,16 @@ class ControlPanel(QWidget):
             f'QPushButton:hover {{ border-color: #8ab; }}'
         )
 
+        rts = getattr(self.app, '_return_to_start', False)
+        rts_label = 'ON' if rts else 'OFF'
+        rts_color = '#1a3a3a' if rts else '#3a1a3a'
+        self.btn_return_to_start.setText(f'Return to Start: {rts_label}')
+        self.btn_return_to_start.setStyleSheet(
+            f'QPushButton {{ background:{rts_color}; color:#cde; border:1px solid #446; '
+            f'padding:2px 6px; border-radius:3px; font-size:10px; font-weight:600; }}'
+            f'QPushButton:hover {{ border-color: #8ab; }}'
+        )
+
         inv = getattr(self.app, '_invert_dirs', False)
         self.btn_invert_dirs.setText(f'Flip Dirs: {"ON" if inv else "OFF"}')
         self.btn_invert_dirs.setStyleSheet(
@@ -2229,6 +2279,7 @@ class SurveyApp:
         self._route_lines_visible = True
         self._route_alpha         = 0.82   # 0.0–1.0; applied to route-line pen
         self._invert_dirs      = False
+        self._return_to_start  = False     # close the route loop back to starting position
         # ── Session summary tracking ──────────────────────────────────────────
         self._survey_start_time     = None   # datetime when Optimize Route clicked
         self._survey_end_time       = None   # datetime when last item collected
@@ -2345,9 +2396,10 @@ class SurveyApp:
         if not placed:
             self._set_log('No placed items to route yet.')
             return
-        self.state.optimise_route()
+        self.state.optimise_route(return_to_start=self._return_to_start)
         self.state.phase     = 'routing'
         self.state.route_idx = 0
+        self.state.route_start_pos = self.state.player_pos if self._return_to_start else None
         # ── Start session tracking ────────────────────────────────────────────
         self._survey_start_time     = datetime.datetime.now()
         self._survey_end_time       = None
@@ -3155,10 +3207,37 @@ class SurveyApp:
     def _trigger_survey_slot(self):
         """Dispatch hotkey press to the right action based on current phase."""
         phase = self.state.phase
+        if phase not in ('routing', 'surveying', 'calibrating'):
+            return
+        # Remember where the cursor was so we can return it after the
+        # double-click finishes (restored in _second_click).
+        self._cursor_restore = self._cursor_pos()
         if phase == 'routing':
             self._click_active_route_slot()
-        elif phase in ('surveying', 'calibrating'):
+        else:
             self._click_next_survey_slot()
+
+    def _cursor_pos(self):
+        """Current mouse cursor position in physical pixels, or None."""
+        if _PYNPUT_AVAILABLE:
+            return _pynput_mouse.Controller().position
+        if sys.platform == 'win32':
+            from ctypes import wintypes
+            pt = wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            return (pt.x, pt.y)
+        return None
+
+    def _restore_cursor(self):
+        """Move the cursor back to the position saved before surveying."""
+        pos = getattr(self, '_cursor_restore', None)
+        if pos is None:
+            return
+        self._cursor_restore = None
+        if _PYNPUT_AVAILABLE:
+            _pynput_mouse.Controller().position = pos
+        elif sys.platform == 'win32':
+            ctypes.windll.user32.SetCursorPos(int(pos[0]), int(pos[1]))
 
     def _do_click(self, x: int, y: int):
         """Move cursor to (x, y) and perform one left click — cross-platform.
@@ -3230,6 +3309,9 @@ class SurveyApp:
 
     def _second_click(self, x, y):
         self._do_click(x, y)
+        # Let the game register the double-click before yanking the cursor away;
+        # restoring immediately cancels the second click.
+        QTimer.singleShot(80, self._restore_cursor)
 
     # ── overlay visibility ────────────────────────────────────────────────────
     def toggle_route_lines(self):
@@ -3426,6 +3508,18 @@ class SurveyApp:
         self._recompute_dot_positions()
         self.save_settings()
 
+    def toggle_return_to_start(self):
+        self._return_to_start = not self._return_to_start
+        if self.state.phase == 'routing':
+            # Recompute order for the closed-loop (or open) tour and refresh.
+            self.state.optimise_route(return_to_start=self._return_to_start)
+            self.state.route_idx = 0
+            if self._return_to_start and self.state.route_start_pos is None:
+                self.state.route_start_pos = self.state.player_pos
+        self.map_overlay.refresh()
+        self.control.refresh()
+        self.save_settings()
+
     def _apply_last_known_zone(self):
         """Scan recent ChatLogs for the most recent 'Entering Area:' line and
         apply it, so Flip Dirs is correct on startup even if the user missed
@@ -3506,6 +3600,7 @@ class SurveyApp:
                 'route_lines_visible':  self._route_lines_visible,
                 'route_alpha':          int(self._route_alpha * 100),
                 'invert_dirs':          self._invert_dirs,
+                'return_to_start':      self._return_to_start,
                 'grid': {
                     'cols': GRID_COLS,
                 },
@@ -3519,6 +3614,7 @@ class SurveyApp:
                 'next_id':     st._next_id,
                 'route_order': st.route_order,
                 'route_idx':   st.route_idx,
+                'route_start_pos': list(st.route_start_pos) if st.route_start_pos else None,
                 'items': [
                     {
                         'id':              i['id'],
@@ -3690,6 +3786,9 @@ class SurveyApp:
             if 'invert_dirs' in data:
                 self._invert_dirs = bool(data['invert_dirs'])
 
+            if 'return_to_start' in data:
+                self._return_to_start = bool(data['return_to_start'])
+
             if 'map_visible' in data:
                 self._map_visible = bool(data['map_visible'])
                 if not self._map_visible:
@@ -3709,6 +3808,7 @@ class SurveyApp:
                 st.player_pos  = tuple(ss['player_pos']) if ss.get('player_pos') else None
                 st.route_order = ss.get('route_order', [])
                 st.route_idx   = ss.get('route_idx', -1)
+                st.route_start_pos = tuple(ss['route_start_pos']) if ss.get('route_start_pos') else None
                 items = []
                 for d in ss.get('items', []):
                     items.append({

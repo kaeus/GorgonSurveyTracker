@@ -79,7 +79,7 @@ If you haven't set a survey count, the hotkey still targets the slot that *would
 
 > **Platform support:** Requires `pip install pynput>=1.7`. Windows also works without pynput via a built-in fallback.
 > On **macOS** you must grant Accessibility permission when prompted (*System Settings → Privacy & Security → Accessibility*).
-> On **Linux X11** pynput works without any extra setup. **Linux Wayland** is not supported and the feature is silently disabled.
+> On **Linux X11** pynput works without any extra setup. On **native Linux Wayland** global hotkeys and auto-click are disabled (the compositor blocks them); relaunch under XWayland with `QT_QPA_PLATFORM=xcb` to enable them — see [Linux (Wayland)](#linux-wayland).
 
 ## Session Summary
 
@@ -152,6 +152,26 @@ Install python-xlib to enable click-through on X11:
 ```
 pip install python-xlib
 ```
+
+### Linux (Wayland)
+
+On a native Wayland session the compositor blocks apps from registering global
+hotkeys, moving/clicking the mouse, and making windows click-through — so those
+features are disabled automatically. You can run the app as an **XWayland** (X11)
+client instead, where they all work, by forcing Qt's X11 platform plugin:
+
+```
+QT_QPA_PLATFORM=xcb python survey_tracker.py
+```
+
+Make sure `pynput` and `python-xlib` are installed (see above). The app detects
+the real Qt platform at startup, so under XWayland hotkeys + auto-click enable
+themselves with no further configuration.
+
+> **Caveat:** synthetic clicks are delivered via XTEST, which can only land on
+> **XWayland (X11) windows**. The game window must therefore also be running
+> under XWayland for auto-click to reach its inventory slots — this is the
+> common case for Proton/Wine titles, which run under XWayland by default.
 
 > **Note:** Overlay might have additional issues if running under some sort of Windows emulation
 

@@ -47,7 +47,24 @@ _WAYLAND = (
     and os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland'
 )
 # Feature gate: True when a cross-platform listener can be started.
+# NOTE: this import-time value is a conservative guess based on the session
+# type. It is refined in main() via _refresh_wayland_gate() once QApplication
+# exists, because a Wayland session can still run the app under XWayland
+# (QT_QPA_PLATFORM=xcb), where hotkeys / clicking / click-through all work.
 _HOTKEY_SUPPORTED = _PYNPUT_AVAILABLE and not _WAYLAND
+
+
+def _refresh_wayland_gate(app):
+    """Re-evaluate the Wayland gate from Qt's real platform plugin.
+
+    QApplication.platformName() returns 'wayland' for the native Wayland plugin
+    and 'xcb' for X11/XWayland. Under XWayland the app runs as an X11 client, so
+    pynput (XTEST) input and the Xlib SHAPE click-through both function — only
+    native Wayland must keep them disabled. No-op off Linux."""
+    global _WAYLAND, _HOTKEY_SUPPORTED
+    if sys.platform.startswith('linux'):
+        _WAYLAND = (app.platformName() == 'wayland')
+        _HOTKEY_SUPPORTED = _PYNPUT_AVAILABLE and not _WAYLAND
 from collections import Counter
 from pathlib import Path
 
@@ -60,7 +77,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore  import Qt, QTimer, QPoint, QSize, pyqtSignal, QObject
 from PyQt5.QtGui   import (
-    QPainter, QColor, QPen, QBrush, QFont, QCursor, QMouseEvent
+    QPainter, QColor, QPen, QBrush, QFont, QCursor, QMouseEvent, QIcon
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2339,6 +2356,13 @@ class SurveyApp:
             self._hotkey_timer = QTimer()
             self._hotkey_timer.timeout.connect(self._poll_hotkeys)
             self._hotkey_timer.start(50)
+        elif _WAYLAND:
+            # Native Wayland blocks global hotkeys + synthetic clicks. Running
+            # under XWayland (QT_QPA_PLATFORM=xcb) re-enables them.
+            self._set_log(
+                '⚠ Hotkeys disabled on native Wayland. '
+                'Relaunch with QT_QPA_PLATFORM=xcb to enable them via XWayland.'
+            )
 
         self._load_settings()
         self.control.refresh()  # update section visibility after settings are loaded
@@ -4211,11 +4235,28 @@ def _macos_raise_overlay(widget):
 
 
 def main():
+    # Give the app its own taskbar identity (icon + grouping) on Windows.
+    # Must run before the QApplication so Windows associates the AppUserModelID.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Kaeus.GorgonSurveyTracker")
+    except Exception:
+        pass
+
     # Enable high-DPI scaling before QApplication is created so Qt handles
     # logical-to-physical pixel mapping on 4K / HiDPI monitors automatically.
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
+
+    # Map-themed window/taskbar icon, bundled alongside the script / in the exe.
+    try:
+        _icon = _resource_path("survey_tracker.ico")
+        if _icon.exists():
+            app.setWindowIcon(QIcon(str(_icon)))
+    except Exception:
+        pass
+    _refresh_wayland_gate(app)   # XWayland vs native Wayland — needs the app
     _macos_activate()   # must be called after QApplication initialises Cocoa
     app.setStyle('Fusion')
 

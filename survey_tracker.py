@@ -77,7 +77,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore  import Qt, QTimer, QPoint, QSize, pyqtSignal, QObject
 from PyQt5.QtGui   import (
-    QPainter, QColor, QPen, QBrush, QFont, QCursor, QMouseEvent
+    QPainter, QColor, QPen, QBrush, QFont, QCursor, QMouseEvent, QIcon
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4235,11 +4235,27 @@ def _macos_raise_overlay(widget):
 
 
 def main():
+    # Give the app its own taskbar identity (icon + grouping) on Windows.
+    # Must run before the QApplication so Windows associates the AppUserModelID.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Kaeus.GorgonSurveyTracker")
+    except Exception:
+        pass
+
     # Enable high-DPI scaling before QApplication is created so Qt handles
     # logical-to-physical pixel mapping on 4K / HiDPI monitors automatically.
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
+
+    # Map-themed window/taskbar icon, bundled alongside the script / in the exe.
+    try:
+        _icon = _resource_path("survey_tracker.ico")
+        if _icon.exists():
+            app.setWindowIcon(QIcon(str(_icon)))
+    except Exception:
+        pass
     _refresh_wayland_gate(app)   # XWayland vs native Wayland — needs the app
     _macos_activate()   # must be called after QApplication initialises Cocoa
     app.setStyle('Fusion')

@@ -3230,6 +3230,9 @@ class SurveyApp:
 
     def _trigger_survey_slot(self):
         """Dispatch hotkey press to the right action based on current phase."""
+        if self.state.ml_mode:
+            self._trigger_ml_slot()
+            return
         phase = self.state.phase
         if phase not in ('routing', 'surveying', 'calibrating'):
             return
@@ -3240,6 +3243,44 @@ class SurveyApp:
             self._click_active_route_slot()
         else:
             self._click_next_survey_slot()
+
+    def _trigger_ml_slot(self):
+        """Motherlode-mode hotkey dispatch.
+
+        Scanning rounds: double-click the next survey map for this round —
+        one slot per distance already recorded, so the target advances as
+        each 'The treasure is X meters' line arrives (positional matching).
+        After trilateration: double-click the active route target's slot
+        (the overlay hides collected entries, so index among uncollected)."""
+        state = self.state
+        if state.ml_round >= 3:
+            active_id = state.ml_active_id
+            if active_id is None:
+                return
+            visible = [e for e in state.ml_surveys if not e.get('collected')]
+            idx = next((i for i, e in enumerate(visible) if e['id'] == active_id), None)
+            if idx is None:
+                return
+        elif state.ml_phase == 'survey':
+            idx = len(state.ml_pending)
+        else:
+            return   # 'set_pos' — waiting for a map click, nothing to use yet
+        self._cursor_restore = self._cursor_pos()
+        self._click_ml_slot(idx)
+
+    def _click_ml_slot(self, idx):
+        """Double-click motherlode overlay slot at index idx."""
+        slots = self.inv_overlay._slots
+        if idx < len(slots):
+            slot = slots[idx]
+            center = slot.mapToGlobal(QPoint(slot.width() // 2, slot.height() // 2))
+        else:
+            center = self._inv_slot_global_pos(idx)
+            if center is None:
+                return
+        x, y = center.x(), center.y()
+        self._do_click(x, y)
+        QTimer.singleShot(120, lambda: self._second_click(x, y))
 
     def _cursor_pos(self):
         """Current mouse cursor position in physical pixels, or None."""
@@ -3687,6 +3728,10 @@ class SurveyApp:
     def _load_settings(self):
         try:
             if not SETTINGS_PATH.exists():
+                # First-ever run: still auto-detect the default ChatLogs folder
+                if _GORGON_CHAT_DEFAULT.is_dir():
+                    self._chat_dir = str(_GORGON_CHAT_DEFAULT)
+                    self.control.lbl_file_status.setText('Chat dir (auto)')
                 return
             data = json.loads(SETTINGS_PATH.read_text())
 

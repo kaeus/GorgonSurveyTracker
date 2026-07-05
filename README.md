@@ -72,6 +72,8 @@ A configurable hotkey (default: **Numpad 0**) lets you trigger inventory slot cl
 |-------|----------------------|
 | **Surveying** | Double-clicks the **next empty slot** in the inventory overlay — use it each time you use a survey map in-game to activate it |
 | **Routing** | Double-clicks the **currently highlighted (active) slot** — use it to collect the item at the active route stop |
+| **Motherlode: scanning** | Double-clicks the **next motherlode map for this round** — the target advances as each distance message arrives, so scan order stays consistent across rounds |
+| **Motherlode: collecting** | Double-clicks the **currently highlighted (active) treasure's slot** — use it to dig at the active route stop |
 
 If you haven't set a survey count, the hotkey still targets the slot that *would* come next based on how many items have been found so far.
 

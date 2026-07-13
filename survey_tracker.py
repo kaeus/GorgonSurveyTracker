@@ -223,6 +223,19 @@ _BONUS_RE        = re.compile(r'Also found (.+?)(?:\s+x(\d+))?\s+\(speed bonus',
 _XP_SKILLS       = frozenset({'surveying', 'mining', 'geology'})
 _ENTER_AREA_RE   = re.compile(r'\*{3,}\s*Entering Area:\s*(.+?)\s*$')
 
+# ── Player.log survey-node auto-advance ──────────────────────────────────────
+# These live in Player.log (one directory up from ChatLogs), NOT the chat log.
+# A '"Using X Survey"' delay-loop followed within ~1 s by a ProcessDeleteItem
+# means a survey item was consumed. For node-spawning surveys (Povus/Vidaria/
+# Mineshaft) that is the only signal we get — they emit no "X collected!" chat
+# line — so we treat it as collecting the active route stop. Regular "Mineral"
+# surveys DO emit "collected!" (handled via the chat log) and would double-count,
+# so _NODE_SPAWN_SURVEY_RE deliberately excludes them.
+_SURVEY_USE_RE        = re.compile(r'ProcessDoDelayLoop\([^)]*"Using (.+?) Survey"', re.IGNORECASE)
+_DELETE_ITEM_RE       = re.compile(r'ProcessDeleteItem\(')
+_LOG_TS_RE            = re.compile(r'^\[(\d{2}):(\d{2}):(\d{2})\]')
+_NODE_SPAWN_SURVEY_RE = re.compile(r'Mineshaft|Povus|Vidaria', re.IGNORECASE)
+
 # Zones whose in-game coordinates are reversed relative to the map image.
 # Flip Dirs auto-toggles ON when entering one of these, OFF otherwise.
 FLIPPED_ZONES    = frozenset({'Kur Mountains'})
@@ -268,6 +281,25 @@ def parse_ml_dist_line(line: str):
 def parse_ml_collect_line(line: str) -> bool:
     """Return True if line is a motherlode Metal Slab collection event."""
     return bool(_ML_COLLECT_RE.search(line))
+
+
+def parse_log_timestamp(line: str):
+    """Return seconds-of-day from a leading '[HH:MM:SS]' Player.log stamp, or None."""
+    m = _LOG_TS_RE.match(line)
+    if not m:
+        return None
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+def parse_survey_use_line(line: str):
+    """Return the survey name from a node-spawning '"Using X Survey"' delay-loop
+    line, or None. Only Povus/Vidaria/Mineshaft surveys qualify — regular Mineral
+    surveys report their own 'X collected!' and are handled via the chat log."""
+    m = _SURVEY_USE_RE.search(line)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    return name if _NODE_SPAWN_SURVEY_RE.search(name) else None
 
 
 def clean_name(name: str) -> str:
@@ -2286,6 +2318,10 @@ class SurveyApp:
         self._chat_dir         = None
         self._chat_file        = None
         self._chat_offset      = 0
+        # Player.log tail (one dir up from ChatLogs) — node-spawn survey auto-advance
+        self._player_log_file    = None
+        self._player_log_offset  = 0
+        self._pending_survey_use = None  # (log_ts_secs, monotonic, survey_name) | None
         self._collect_last     = 0.0  # time.monotonic() of last collection
         self._ml_collect_last  = 0.0  # time.monotonic() of last motherlode collection
         self._click_through    = False
@@ -2395,6 +2431,9 @@ class SurveyApp:
         self._chat_dir    = path
         self._chat_file   = None
         self._chat_offset = 0
+        self._player_log_file    = None
+        self._player_log_offset  = 0
+        self._pending_survey_use = None
         self.control.lbl_file_status.setText('Chat dir loaded')
         self._set_log('ChatLogs folder selected — monitoring for survey markers and collections.')
         self.save_settings()
@@ -2469,8 +2508,15 @@ class SurveyApp:
         )
 
     def mark_complete(self):
+        # Button slot (takes no args — Qt's 'clicked' bool is dropped by PyQt).
         # Manually mark the current route target as collected (for survey types
         # with no chat collection message), then advance to the next stop.
+        self._complete_active_target(auto=False)
+
+    def _complete_active_target(self, auto: bool = False):
+        # Mark the current route target collected and advance. Shared by the
+        # manual "Mark Complete" button and the Player.log node-spawn detector
+        # (auto=True), which fires when a Povus/Vidaria/Mineshaft survey is used.
         state = self.state
         if state.phase != 'routing' or state.active_id is None:
             return
@@ -2491,7 +2537,10 @@ class SurveyApp:
             self.control.sb_count.setValue(state.survey_count)
             self.control.sb_count.blockSignals(False)
         state.reindex()
-        self._set_log(f'✔ {clean_name(target["name"])} marked complete — removed from inventory.')
+        if auto:
+            self._set_log(f'🪏 {clean_name(target["name"])} — survey used, auto-marked complete.')
+        else:
+            self._set_log(f'✔ {clean_name(target["name"])} marked complete — removed from inventory.')
 
         remaining = [
             (idx, iid) for idx, iid in enumerate(state.route_order)
@@ -2974,6 +3023,7 @@ class SurveyApp:
 
     def _poll(self):
         self._poll_chat_log()
+        self._poll_player_log()
 
     def _poll_chat_log(self):
         if not self._chat_dir:
@@ -3048,6 +3098,77 @@ class SurveyApp:
                                     )
         except Exception:
             pass
+
+    # ── Player.log tail (node-spawn survey auto-advance) ───────────────────────
+    def _poll_player_log(self):
+        """Tail Player.log (one dir up from ChatLogs) for node-spawn survey usage.
+
+        Povus/Vidaria/Mineshaft surveys emit no 'X collected!' chat line, so we
+        detect the survey being consumed — a '"Using X Survey"' delay-loop
+        followed within ~1 s by a ProcessDeleteItem — and treat that as
+        collecting the active route stop (same as clicking Mark Complete).
+        """
+        if not self._chat_dir:
+            return
+        try:
+            # Player.log sits alongside the ChatLogs folder, one level up.
+            path = Path(self._chat_dir).parent / 'Player.log'
+            if not path.is_file():
+                return
+            # Discover / re-anchor to the end on first sight or chat-dir change.
+            if self._player_log_file != path:
+                self._player_log_file    = path
+                self._player_log_offset  = path.stat().st_size
+                self._pending_survey_use = None
+                return
+            size = path.stat().st_size
+            if size < self._player_log_offset:   # game restart truncated Player.log
+                self._player_log_file    = None
+                self._player_log_offset  = 0
+                self._pending_survey_use = None
+                return
+            if size > self._player_log_offset:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    f.seek(self._player_log_offset)
+                    new_text = f.read()
+                self._player_log_offset = size
+                for line in new_text.splitlines():
+                    self._scan_player_log_line(line)
+        except Exception:
+            pass
+
+    def _scan_player_log_line(self, line: str):
+        # A node-spawn survey use arms the pending state; a ProcessDeleteItem
+        # within 1 s (by log timestamp) confirms the spawn and advances the node.
+        name = parse_survey_use_line(line)
+        if name is not None:
+            ts = parse_log_timestamp(line)
+            if ts is not None:
+                self._pending_survey_use = (ts, time.monotonic(), name)
+            return
+        if self._pending_survey_use is not None and _DELETE_ITEM_RE.search(line):
+            ts_del = parse_log_timestamp(line)
+            if ts_del is None:
+                return
+            ts_use, mono_use, survey_name = self._pending_survey_use
+            diff = ts_del - ts_use
+            if diff < 0:
+                diff += 86400   # midnight rollover
+            # Log timestamps are whole seconds; require the delete within 1 s of
+            # the use, plus a wall-clock guard so a stale arm can't match later.
+            if diff <= 1 and (time.monotonic() - mono_use) <= 3.0:
+                self._pending_survey_use = None
+                self._on_survey_node_spawned(survey_name)
+
+    def _on_survey_node_spawned(self, survey_name: str):
+        state = self.state
+        if state.ml_mode:
+            return
+        if state.phase != 'routing' or state.active_id is None:
+            return
+        print(f'[survey-node] "{survey_name}" consumed → auto-advance | '
+              f'route_idx={state.route_idx} | time={datetime.datetime.now()}')
+        self._complete_active_target(auto=True)
 
     # ── inventory slot click ──────────────────────────────────────────────────
     def on_inventory_click(self, item: dict):

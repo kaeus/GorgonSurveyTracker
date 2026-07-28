@@ -88,6 +88,7 @@ GRID_ROWS   = 8
 SLOT_SIZE   = 50          # px
 SLOT_GAP    = 2           # px
 HEADER_H    = 28          # px — header height for both overlays
+UNDO_LIMIT  = 50          # how many collect/skip steps can be reverted
 
 # Qt.Key_* → human-readable label (platform-neutral; used by HotkeyCaptureDialog)
 # Populated after Qt is imported so Qt.Key_* constants are available.
@@ -1869,9 +1870,16 @@ class ControlPanel(QWidget):
         self.btn_done    = self._btn('🗺 Optimize Route',   self.app.done_surveying,   '#5a4a00')
         self.btn_next    = self._btn('→ Skip to Next',      self.app.advance_route,    '#1a3a5a')
         self.btn_mark    = self._btn('✔ Mark Complete',     self.app.mark_complete,    '#2a4a1a')
+        self.btn_undo    = self._btn('↶ Undo',              self.app.undo_last,        '#4a3a1a')
         self.btn_reset   = self._btn('🗑 Reset',            self.app.reset_survey,     '#5a1a1a')
         self.btn_summary = self._btn('📊 View Summary',     self.app.show_summary,     '#1a3a4a')
-        for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next, self.btn_mark, self.btn_reset, self.btn_summary):
+        self.btn_undo.setToolTip(
+            'Revert the last completed (or skipped) survey — it goes back into the\n'
+            'inventory grid and becomes the current route stop again.\n'
+            'Useful in zones like Vidaria and Povus, where the chat log can report a\n'
+            'survey as collected before you have actually picked it up.'
+        )
+        for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next, self.btn_mark, self.btn_undo, self.btn_reset, self.btn_summary):
             rc_layout.addWidget(b)
         rc_layout.addStretch()
         vert_layout.addLayout(rc_layout)
@@ -2108,6 +2116,9 @@ class ControlPanel(QWidget):
             )
             self.btn_next.setVisible(state.phase == 'routing')
             self.btn_mark.setVisible(state.phase == 'routing')
+            # Stays available after the final stop, so a survey that auto-completed
+            # itself and ended the run can still be put back.
+            self.btn_undo.setVisible(bool(getattr(self.app, '_undo_stack', None)))
             self.btn_reset.setVisible(has_items or state.phase != 'idle')
             self.btn_summary.setVisible(
                 getattr(self.app, '_summary_data', None) is not None
@@ -2305,6 +2316,8 @@ class SurveyApp:
         self._inv_items             = {}     # item_name -> total count (primary + bonus)
         self._tracking_xp           = False  # True while routing session is live
         self._summary_data          = None   # dict; set when session completes
+        # ── Undo stack for collect/skip steps ─────────────────────────────────
+        self._undo_stack            = []     # newest last; see _push_undo()
 
         # Polling timer (0.5 s)
         self._timer = QTimer()
@@ -2432,6 +2445,7 @@ class SurveyApp:
         self._inv_items             = {}
         self._tracking_xp           = True
         self._summary_data          = None
+        self._undo_stack            = []
         # ─────────────────────────────────────────────────────────────────────
         self._refresh_all()
         first = next((i for i in self.state.items if i['id'] == self.state.active_id), None)
@@ -2441,12 +2455,74 @@ class SurveyApp:
             f' (slot {first["grid_index"] + 1 if first else "?"})'
         )
 
+    # ── undo ──────────────────────────────────────────────────────────────────
+    def _push_undo(self, kind: str, item: dict):
+        """Snapshot everything a collect/skip is about to change, so it can be reverted.
+
+        kind is 'collect' or 'skip'. Called immediately *before* the mutation.
+        """
+        state = self.state
+        self._undo_stack.append({
+            'kind':            kind,
+            'item_id':         item['id'],
+            'item_name':       item['name'],
+            'player_pos':      state.player_pos,
+            'route_idx':       state.route_idx,
+            'phase':           state.phase,
+            'survey_count':    state.survey_count,
+            'ts_count':        len(self._collection_timestamps),
+            'survey_end_time': self._survey_end_time,
+            'summary_data':    self._summary_data,
+        })
+        del self._undo_stack[:-UNDO_LIMIT]
+
+    def undo_last(self):
+        """Revert the most recent collect/skip and make that survey the active stop.
+
+        Mainly for zones (Vidaria, Povus) where the chat log reports a survey as
+        collected before you have actually picked it up.
+        """
+        if not self._undo_stack:
+            self._set_log('Nothing to undo.')
+            return
+        snap  = self._undo_stack.pop()
+        state = self.state
+        item  = next((i for i in state.items if i['id'] == snap['item_id']), None)
+        if item is None:
+            self._set_log('⚠ Could not undo — that survey is no longer tracked.')
+            self._refresh_all()
+            return
+
+        if snap['kind'] == 'collect':
+            item['collected'] = False
+        else:
+            item['skipped'] = False
+
+        state.player_pos   = snap['player_pos']
+        state.route_idx    = snap['route_idx']
+        state.phase        = snap['phase']
+        state.survey_count = snap['survey_count']
+        self.control.sb_count.blockSignals(True)
+        self.control.sb_count.setValue(state.survey_count)
+        self.control.sb_count.blockSignals(False)
+        del self._collection_timestamps[snap['ts_count']:]
+        self._survey_end_time = snap['survey_end_time']
+        self._summary_data    = snap['summary_data']
+        state.reindex()
+        self._refresh_all()
+        self._set_log(
+            f'↶ Undid {"completion" if snap["kind"] == "collect" else "skip"} of '
+            f'{clean_name(snap["item_name"])} — it is the current stop again '
+            f'(slot {item["grid_index"] + 1}).'
+        )
+
     def advance_route(self):
         # Mark the current target as skipped — removes it from the map
         current_id = self.state.active_id
         if current_id is not None:
             cur = next((i for i in self.state.items if i['id'] == current_id), None)
             if cur:
+                self._push_undo('skip', cur)
                 cur['skipped'] = True
 
         remaining = [
@@ -2477,6 +2553,8 @@ class SurveyApp:
         target = next((i for i in state.items if i['id'] == state.active_id), None)
         if not target or target['collected']:
             return
+
+        self._push_undo('collect', target)
 
         if target['pixel_pos']:
             state.player_pos = target['pixel_pos']
@@ -2535,6 +2613,7 @@ class SurveyApp:
         self._inv_items             = {}
         self._tracking_xp           = False
         self._summary_data          = None
+        self._undo_stack            = []
         self._refresh_all()
         self._set_log('Survey reset. Set your position and start a new survey.')
 
@@ -2708,6 +2787,8 @@ class SurveyApp:
         if not target:
             print(f'[collect]   no target found — ignored')
             return
+
+        self._push_undo('collect', target)
 
         # Move player marker to the collected item's location (you were there to grab it)
         if target['pixel_pos']:

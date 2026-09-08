@@ -1898,12 +1898,13 @@ class ControlPanel(QWidget):
         rc_layout.addWidget(self.sb_count)
         self.btn_set_pos = self._btn('📍 Set My Position', self.app.enter_set_player, '#1a4a2a')
         self.btn_start   = self._btn('▶ Start Survey',     self.app.start_surveying,  '#1a3a5a')
-        self.btn_done    = self._btn('🗺 Optimize Route',   self.app.done_surveying,   '#5a4a00')
-        self.btn_next    = self._btn('→ Skip to Next',      self.app.advance_route,    '#1a3a5a')
+        self.btn_done    = self._btn('🗺 Optimize Route',   self.app.done_surveying,     '#5a4a00')
+        self.btn_auto    = self._btn('▶▶ Auto Survey',      self.app.toggle_auto_survey, '#1a4a3a')
+        self.btn_next    = self._btn('→ Skip to Next',      self.app.advance_route,      '#1a3a5a')
         self.btn_mark    = self._btn('✔ Mark Complete',     self.app.mark_complete,    '#2a4a1a')
         self.btn_reset   = self._btn('🗑 Reset',            self.app.reset_survey,     '#5a1a1a')
         self.btn_summary = self._btn('📊 View Summary',     self.app.show_summary,     '#1a3a4a')
-        for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_next, self.btn_mark, self.btn_reset, self.btn_summary):
+        for b in (self.btn_set_pos, self.btn_start, self.btn_done, self.btn_auto, self.btn_next, self.btn_mark, self.btn_reset, self.btn_summary):
             rc_layout.addWidget(b)
         rc_layout.addStretch()
         vert_layout.addLayout(rc_layout)
@@ -1942,10 +1943,17 @@ class ControlPanel(QWidget):
         row_ml.addWidget(self.lbl_ml_count)
         self.btn_ml_next  = self._btn('Next Position', self.app.ml_next_position, '#2a2a5a')
         row_ml.addWidget(self.btn_ml_next)
+        self.btn_ml_auto  = self._btn('▶▶ Auto Scan', self.app.toggle_auto_survey, '#1a4a3a')
+        self.btn_ml_auto.setToolTip(
+            'Auto-click the next survey map after each distance reading, until the '
+            'round is scanned. Hotkey or "Next Position" stops it.'
+        )
+        row_ml.addWidget(self.btn_ml_auto)
         self.btn_ml_skip  = self._btn('Skip', self.app.ml_skip_next, '#2a3a2a')
         self.btn_ml_skip.setVisible(False)
         row_ml.addWidget(self.btn_ml_skip)
-        self.btn_ml_reset = self._btn('Reset Motherlode', self.app.reset_ml, '#5a1a1a')
+        self.btn_ml_reset = self._btn('Reset', self.app.reset_ml, '#5a1a1a')
+        self.btn_ml_reset.setToolTip('Reset the motherlode survey (positions, distances, and route).')
         row_ml.addWidget(self.btn_ml_reset)
         row_ml.addStretch()
         ml_layout.addLayout(row_ml)
@@ -2138,6 +2146,10 @@ class ControlPanel(QWidget):
             self.btn_done.setVisible(
                 state.phase in ('surveying', 'calibrating') and placed
             )
+            self.btn_auto.setVisible(state.phase in ('surveying', 'calibrating'))
+            self.btn_auto.setText(
+                '⏹ Stop Auto' if self.app._auto_surveying else '▶▶ Auto Survey'
+            )
             self.btn_next.setVisible(state.phase == 'routing')
             self.btn_mark.setVisible(state.phase == 'routing')
             self.btn_reset.setVisible(has_items or state.phase != 'idle')
@@ -2174,6 +2186,11 @@ class ControlPanel(QWidget):
                 state.ml_phase == 'survey'
                 and len(state.ml_pending) > 0
                 and state.ml_round < 3
+            )
+            scanning = state.ml_phase == 'survey' and state.ml_round < 3
+            self.btn_ml_auto.setVisible(scanning)
+            self.btn_ml_auto.setText(
+                '⏹ Stop Auto' if self.app._auto_surveying else '▶▶ Auto Scan'
             )
             in_routing = state.ml_round >= 3 and bool(state.ml_route_order)
             has_more = in_routing and any(
@@ -2302,6 +2319,8 @@ class _UpdateChecker(QObject):
 class SurveyApp:
     def __init__(self):
         self.state = SurveyState()
+
+        self._auto_surveying   = False
 
         # Update-check state (must exist before ControlPanel._build_ui reads it via refresh_update_button).
         self._latest_version       = None
@@ -2454,6 +2473,7 @@ class SurveyApp:
         self._set_log('Watching chat log for survey markers. Survey your maps in-game!')
 
     def done_surveying(self):
+        self._auto_surveying = False
         uncollected = self.state.uncollected()
         placed = [i for i in uncollected if i['pixel_pos']]
         if not placed:
@@ -2563,6 +2583,7 @@ class SurveyApp:
         self._refresh_all()
 
     def reset_survey(self):
+        self._auto_surveying = False
         if self.state.items:
             ans = QMessageBox.question(
                 self.control, 'Reset Survey',
@@ -2645,6 +2666,8 @@ class SurveyApp:
 
             state.phase = 'surveying'
             self._refresh_all()
+            if self._auto_surveying:
+                QTimer.singleShot(200, self._click_next_survey_slot)
             return
 
         # During survey: recalibrate using most recent placed item
@@ -2706,6 +2729,8 @@ class SurveyApp:
                         f'📍 {clean_name(name)} refined ({n} readings).'
                     )
                     self._refresh_all()
+            if self._auto_surveying and state.phase == 'surveying':
+                QTimer.singleShot(200, self._click_next_survey_slot)
             return  # duplicate — do not add a new item
 
         item = state.add_item(name, offset)
@@ -2729,6 +2754,8 @@ class SurveyApp:
             self._set_log(
                 f'✅ {clean_name(name)} auto-placed — slot {item["grid_index"] + 1}.'
             )
+            if self._auto_surveying:
+                QTimer.singleShot(200, self._click_next_survey_slot)
 
         self._refresh_all()
 
@@ -2805,11 +2832,13 @@ class SurveyApp:
     # ── polling ───────────────────────────────────────────────────────────────
     # ── Motherlode mode ───────────────────────────────────────────────────────
     def enter_ml_mode(self):
+        self._auto_surveying = False
         self.state.ml_mode = True
         self._set_log('Motherlode mode: click map to set Position 1.')
         self._refresh_all()
 
     def exit_ml_mode(self):
+        self._auto_surveying = False
         self.state.ml_mode = False
         self._set_log('Returned to Regular Survey mode.')
         self._refresh_all()
@@ -2822,6 +2851,7 @@ class SurveyApp:
             self._set_log('Scan at least one motherlode first.')
             return
 
+        self._auto_surveying = False   # committing a round ends this round's auto-scan
         round_idx = state.ml_round
         pending   = list(state.ml_pending)
 
@@ -2970,6 +3000,7 @@ class SurveyApp:
         self._set_log(f'Next: Treasure {entry["id"]}' if entry else 'Route complete.')
 
     def reset_ml(self):
+        self._auto_surveying = False
         state = self.state
         state.ml_round       = 0
         state.ml_phase       = 'set_pos'
@@ -3078,6 +3109,9 @@ class SurveyApp:
                             self.control.refresh()
                             self.map_overlay.refresh()
                             self.inv_overlay.refresh()
+                            # Auto-scan: chain the next map click once this reading lands.
+                            if self._auto_surveying:
+                                QTimer.singleShot(250, self._ml_auto_click_next)
                         if parse_ml_collect_line(line):
                             self._on_ml_collected()
                     else:
@@ -3351,6 +3385,11 @@ class SurveyApp:
 
     def _trigger_survey_slot(self):
         """Dispatch hotkey press to the right action based on current phase."""
+        if self._auto_surveying:
+            self._auto_surveying = False
+            self._set_log('Auto-survey cancelled.')
+            self._refresh_all()
+            return
         if self.state.ml_mode:
             self._trigger_ml_slot()
             return
@@ -3364,6 +3403,62 @@ class SurveyApp:
             self._click_active_route_slot()
         else:
             self._click_next_survey_slot()
+
+    def toggle_auto_survey(self):
+        if self._auto_surveying:
+            self._auto_surveying = False
+            self._set_log('Auto-survey stopped.')
+            self._refresh_all()
+            return
+        if self.state.ml_mode:
+            # Motherlode auto-scan only makes sense mid-round (position set, not
+            # yet committed). Kick off the first click; the chat-log handler
+            # chains the rest as each 'meters from here' line arrives.
+            if not (self.state.ml_phase == 'survey' and self.state.ml_round < 3):
+                self._set_log('Auto-scan runs during a scanning round — set the position first.')
+                return
+            self._auto_surveying = True
+            self._set_log('Auto-scan started — hotkey cancels.')
+            self._ml_auto_click_next()
+        else:
+            self._auto_surveying = True
+            self._set_log('Auto-survey started — hotkey cancels.')
+            self._click_next_survey_slot()
+        self._refresh_all()
+
+    def _ml_auto_click_next(self):
+        """Auto-scan: double-click the next motherlode slot for this round, then
+        arm a stall check that stops auto if the click produced no new distance
+        (out of survey maps). Mirrors regular auto-survey, chained off chat lines."""
+        if not self._auto_surveying:
+            return
+        state = self.state
+        if not (state.ml_mode and state.ml_phase == 'survey' and state.ml_round < 3):
+            return
+        n = len(state.ml_pending)
+        # Rounds after the first know the motherlode count — stop when all scanned
+        # so auto never clicks past the last map into unrelated inventory.
+        if state.ml_round > 0 and n >= len(state.ml_surveys):
+            self._auto_surveying = False
+            self._set_log('Auto-scan: all motherlodes scanned this round — click "Next Position".')
+            self._refresh_all()
+            return
+        self._click_ml_slot(n)
+        # The first round (ml_round 0) has no known count; rely on the stall
+        # check to end the chain when the survey maps run out.
+        QTimer.singleShot(3500, lambda n=n: self._ml_auto_stall_check(n))
+
+    def _ml_auto_stall_check(self, n_at_click):
+        """Stop auto-scan if no new distance line arrived after the last click."""
+        if not self._auto_surveying:
+            return
+        if not (self.state.ml_mode and self.state.ml_phase == 'survey'
+                and self.state.ml_round < 3):
+            return
+        if len(self.state.ml_pending) <= n_at_click:
+            self._auto_surveying = False
+            self._set_log('Auto-scan stopped — no new distance detected (out of survey maps?).')
+            self._refresh_all()
 
     def _trigger_ml_slot(self):
         """Motherlode-mode hotkey dispatch.

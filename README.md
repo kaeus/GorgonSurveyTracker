@@ -64,6 +64,8 @@ The program relies on chat logs. To enable these, go to the Game Settings, under
 
 > **Tip:** The inventory grid layout (`cols`) can be tweaked by editing the `grid` section in `survey_tracker_settings.json` if you dont want to use 10 columns. The sizing should auto scale as you resize the inventory window to match your screen.
 
+> **Tip:** On a small map the dots can cover your character. Lower `dot_radius` (survey dots, default `4`) and `player_dot_radius` (your position marker, default `5`) in `survey_tracker_settings.json` — values are in pixels, 1–20. Edit while the tracker is closed, since it rewrites the file on exit.
+
 ## Survey Hotkey
 
 A configurable hotkey (default: **Numpad 0**) lets you trigger inventory slot clicks without leaving the game window.

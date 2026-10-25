@@ -796,6 +796,19 @@ class LockButton(QWidget):
         self.update()
 
 
+def _dot_pen_width(radius: int) -> float:
+    """Outline width for a map dot — thinner on small dots so the fill still shows."""
+    return max(1.0, min(2.0, radius / 2))
+
+
+def _clamp_dot_radius(value, default: int) -> int:
+    """Parse a dot radius from settings JSON, clamped to 1–20 px."""
+    try:
+        return max(1, min(20, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Map Overlay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -898,9 +911,10 @@ class MapOverlay(DragMixin, QWidget):
         if self.state.player_pos:
             px, py_ = self.state.player_pos
             py_s = py_ + cy
+            pr = self.app._player_dot_radius
             p.setBrush(QBrush(QColor(0, 230, 118, 220)))
-            p.setPen(QPen(QColor(255, 255, 255, 220), 2))
-            p.drawEllipse(int(px) - 5, int(py_s) - 5, 10, 10)
+            p.setPen(QPen(QColor(255, 255, 255, 220), _dot_pen_width(pr)))
+            p.drawEllipse(int(px) - pr, int(py_s) - pr, pr * 2, pr * 2)
 
         # ── survey dots ──
         p.setFont(QFont('Segoe UI', 8))
@@ -940,7 +954,7 @@ class MapOverlay(DragMixin, QWidget):
             self._draw_ml_overlay(p, cy)
 
     def _draw_dot(self, p, dx, dy, kind, item):
-        DOT_R = 4
+        DOT_R = self.app._dot_radius
         colours = {
             'pending':   (QColor(255, 193,  7, 230), QColor(255, 255, 255, 200)),
             'placed':    (QColor( 79, 195, 247, 210), QColor(255, 255, 255, 160)),
@@ -949,7 +963,7 @@ class MapOverlay(DragMixin, QWidget):
         }
         fill, stroke = colours.get(kind, colours['placed'])
         p.setBrush(QBrush(fill))
-        p.setPen(QPen(stroke, 2))
+        p.setPen(QPen(stroke, _dot_pen_width(DOT_R)))
         p.drawEllipse(int(dx) - DOT_R, int(dy) - DOT_R, DOT_R * 2, DOT_R * 2)
 
         if kind == 'collected':
@@ -2361,6 +2375,8 @@ class SurveyApp:
         self._map_visible      = True
         self._route_lines_visible = True
         self._route_alpha         = 0.82   # 0.0–1.0; applied to route-line pen
+        self._dot_radius          = 4      # px; survey dot radius (settings JSON only)
+        self._player_dot_radius   = 5      # px; player marker radius (settings JSON only)
         self._invert_dirs      = False
         self._return_to_start  = False     # close the route loop back to starting position
         # ── Session summary tracking ──────────────────────────────────────────
@@ -3961,6 +3977,8 @@ class SurveyApp:
                 'inv_visible':          self._inv_visible,
                 'route_lines_visible':  self._route_lines_visible,
                 'route_alpha':          int(self._route_alpha * 100),
+                'dot_radius':           self._dot_radius,
+                'player_dot_radius':    self._player_dot_radius,
                 'invert_dirs':          self._invert_dirs,
                 'return_to_start':      self._return_to_start,
                 'grid': {
@@ -4144,6 +4162,13 @@ class SurveyApp:
 
             if 'route_alpha' in data:
                 self._route_alpha = max(0.0, min(1.0, int(data['route_alpha']) / 100.0))
+
+            if 'dot_radius' in data:
+                self._dot_radius = _clamp_dot_radius(data['dot_radius'], self._dot_radius)
+
+            if 'player_dot_radius' in data:
+                self._player_dot_radius = _clamp_dot_radius(data['player_dot_radius'],
+                                                            self._player_dot_radius)
 
             if 'skip_update_version' in data:
                 sv = data.get('skip_update_version')
